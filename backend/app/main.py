@@ -1,5 +1,8 @@
-
 import os
+
+# Prevent OpenMP duplicate runtime abort on macOS between PyTorch and FAISS
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
@@ -45,8 +48,49 @@ class DiagnoseRequest(BaseModel):
 def health_check():
     return {"status": "ok", "service": "FixProof API"}
 
+from app.vault import default_vault
+
+@app.get("/api/vault/status")
+def get_vault_status():
+    """Returns the current size, embedding dimensions, and indexed assets of the FAISS reference vault."""
+    return default_vault.get_status()
+
+
+@app.post("/api/vault/index/{asset_id}")
+def index_existing_asset(asset_id: str):
+    """
+    Indexes extracted frames for an existing asset into the FAISS vault
+    without needing to re-upload the video.
+    """
+    asset_frames_dir = FRAMES_DIR / asset_id
+    if not asset_frames_dir.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Asset '{asset_id}' not found. No extracted frames exist in storage.",
+        )
+    try:
+        indexed_records = default_vault.index_asset_frames(
+            asset_id=asset_id,
+            frames_dir=asset_frames_dir,
+        )
+        return {
+            "status": "indexed",
+            "asset_id": asset_id,
+            "frames_indexed": len(indexed_records),
+            "vault_size": default_vault.vector_db.ntotal,
+            "indexed_records": indexed_records,
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to index asset: {e}")
+
+
 @app.post("/api/vault/ingest")
-async def ingest_reference_video(file: UploadFile = File(...)):
+async def ingest_reference_video(
+    file: UploadFile = File(...),
+    auto_index: bool = False,
+):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file was provided.")
     # 1. Validate file extension
@@ -90,7 +134,7 @@ async def ingest_reference_video(file: UploadFile = File(...)):
             sample_interval_sec=5,
         )
 
-        return {
+        response_data = {
             "status": "uploaded",
             "asset_id": asset_id,
             "filename": file.filename,
@@ -101,6 +145,20 @@ async def ingest_reference_video(file: UploadFile = File(...)):
             "sample_interval_seconds": 5,
             "frames": extracted_frames,
         }
+
+        # 5. Optionally index into the FAISS vault immediately
+        if auto_index:
+            indexed_records = default_vault.index_asset_frames(
+                asset_id=asset_id,
+                frames=extracted_frames,
+                frames_dir=asset_frames_dir,
+            )
+            response_data["status"] = "indexed"
+            response_data["indexed"] = True
+            response_data["vault_size"] = default_vault.vector_db.ntotal
+            response_data["indexed_records"] = indexed_records
+
+        return response_data
     except HTTPException:
         # Clean up any partially written video and frame directory on HTTP exceptions
         if target_path.exists():
@@ -128,7 +186,8 @@ async def ingest_reference_video(file: UploadFile = File(...)):
             detail=f"Failed to process video: {err}",
         )
     finally:
-        await file.close()      
+        await file.close()
+      
 
 
 @app.post("/diagnose")

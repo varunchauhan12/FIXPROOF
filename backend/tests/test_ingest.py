@@ -5,9 +5,15 @@ Tests for FixProof Video Ingestion and Frame Extraction (Milestone 2).
 import io
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+# Ensure backend root is on sys.path
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 import cv2
 import numpy as np
