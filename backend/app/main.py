@@ -1,8 +1,9 @@
 
 import os
-
+import uuid
+from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
@@ -20,6 +21,16 @@ app.add_middleware(
 )
 
 
+# Storage directory for official reference videos
+STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage" / "videos"
+STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+# Allowed video extensions and 50 MB size limit for reference uploads
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+CHUNK_SIZE_BYTES = 1024 * 1024          # 1 MB chunk for streaming
+
+
+
 class DiagnoseRequest(BaseModel):
     issue_description: str
 
@@ -27,6 +38,56 @@ class DiagnoseRequest(BaseModel):
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "FixProof API"}
+
+@app.post("/api/vault/ingest")
+async def ingest_reference_video(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file was provided.")
+    # 1. Validate file extension
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported file type '{file_ext}'. "
+                f"Allowed video formats: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+            ),
+        )
+    # 2. Generate unique asset ID (storage path never uses original filename)
+    asset_id = str(uuid.uuid4())
+    stored_filename = f"{asset_id}{file_ext}"
+    target_path = STORAGE_DIR / stored_filename
+    total_bytes = 0
+    # 3. Stream chunks to disk and enforce size limit
+    try:
+        with open(target_path, "wb") as buffer:
+            while chunk := await file.read(CHUNK_SIZE_BYTES):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_FILE_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"File exceeds maximum allowed size of "
+                            f"{MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB."
+                        ),
+                    )
+                buffer.write(chunk)
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        return {
+            "status": "uploaded",
+            "asset_id": asset_id,
+            "filename": file.filename,
+            "file_size": total_bytes,
+            "content_type": file.content_type,
+        }
+    except Exception:
+        # 4. Clean up any partially written file on error
+        if target_path.exists():
+            target_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()      
 
 
 @app.post("/diagnose")
