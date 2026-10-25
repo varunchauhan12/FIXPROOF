@@ -1,69 +1,91 @@
-import Image from "next/image";
+"use client";
+
+import { useState } from "react";
+
+type DiagnosisResponse = {
+  diagnosis: string;
+  model: string;
+  provider: string;
+};
 
 export default function Home() {
+  const [issue, setIssue] = useState("");
+  const [result, setResult] = useState<DiagnosisResponse | null>();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleDiagnose = async () => {
+    if (!issue.trim()) {
+      setError("Please describe a bug first.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setResult(null);
+    try {
+      const response = await fetch("http://localhost:8000/diagnose", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          issue_description: issue,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to get diagnosis");
+      }
+      const data: DiagnosisResponse = await response.json();
+      setResult(data);
+    } catch (error) {
+      setError("Could not reach FixProof. Check that the backend is running.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <main className="mx-auto min-h-screen max-w-3xl p-8">
+      <h1 className="text-4xl font-bold">FixProof</h1>
+      <p className="mt-3 text-gray-600">
+        Investigate bugs with AI-powered debugging.
+      </p>
+      <label htmlFor="issue" className="mt-8 block font-semibold">
+        Describe your bug
+      </label>
+      <textarea
+        id="issue"
+        value={issue}
+        onChange={(event) => setIssue(event.target.value)}
+        placeholder="Describe what went wrong..."
+        className="mt-3 min-h-36 w-full rounded-lg border p-4"
+      />{" "}
+      <button
+        onClick={handleDiagnose}
+        disabled={loading}
+        className="mt-4 rounded-lg bg-black px-5 py-3 text-white disabled:opacity-50"
+      >
+        {loading ? "Investigating..." : "Diagnose bug"}
+      </button>
+      {error && <p className="mt-4 text-red-600">{error}</p>}
+      {result && (
+        <section className="mt-8 rounded-xl border p-5">
+          <h2 className="text-xl font-semibold">Preliminary diagnosis</h2>
+
+          <p className="mt-4 whitespace-pre-wrap">{result.diagnosis}</p>
+
+          <p className="mt-5 text-sm text-gray-500">Model: {result.model}</p>
+
+          <p className="text-sm text-gray-500">Provider: {result.provider}</p>
+
+          <p className="mt-3 text-sm text-amber-700">
+            This is an initial hypothesis. Source code inspection and test
+            verification are not implemented yet.
           </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+        </section>
+      )}
+    </main>
   );
 }
