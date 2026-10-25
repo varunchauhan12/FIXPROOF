@@ -4,3 +4,5 @@ openai>=1.40.0
 python-dotenv>=1.0.0
 pydantic>=2.8.0
 python-multipart
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
