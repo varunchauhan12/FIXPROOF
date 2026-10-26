@@ -1,6 +1,8 @@
+import mimetypes
 import os
 import re
 from datetime import datetime, timezone
+from typing import Optional, Union
 
 # Prevent OpenMP duplicate runtime abort on macOS between PyTorch and FAISS
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -38,6 +40,14 @@ async def add_cache_control_headers(request: Request, call_next):
 
 import shutil
 from app.extractor import extract_video_frames, preflight_video_file
+from app.matcher import analyze_asset_matches
+from app.url_screener import (
+    screen_video_url,
+    SSRFValidationError,
+    UnsupportedPlatformError,
+    MetadataExtractionError,
+    SUSPECTS_THUMBNAILS_DIR,
+)
 from app.vault import default_vault
 from app.db import get_db_config, default_db_manager
 from app.storage import SupabaseStorageClient, StorageNotFoundError, StorageError
@@ -48,8 +58,27 @@ from app.registry import (
     delete_asset_record,
     load_incidents,
     save_incident,
+    get_incident_by_id,
+    save_nemotron_report,
+    get_nemotron_report_by_id,
+    get_nemotron_reports_for_incident,
     is_cloud_mode,
 )
+from app.evidence_models import (
+    build_frame_evidence_from_matches,
+    build_investigation_input_from_incident,
+)
+from app.timeline import cluster_frame_matches
+from app.nemotron_engine import generate_nemotron_report
+from typing import Optional
+
+class ScreenUrlRequest(BaseModel):
+    url: str
+
+class InvestigateIncidentRequest(BaseModel):
+    force_refresh: bool = False
+    model_override: Optional[str] = None
+
 
 # Storage directory for official reference videos and extracted frames
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage" / "videos"
@@ -73,9 +102,50 @@ SUSPECTS_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 SUSPECTS_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Allowed video extensions and 50 MB size limit for reference uploads
-ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+ALLOWED_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".m4v",
+    ".flv",
+    ".wmv",
+    ".ts",
+    ".3gp",
+    ".ogg",
+    ".ogv",
+}
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 CHUNK_SIZE_BYTES = 1024 * 1024          # 1 MB chunk for streaming
+
+MIME_TYPE_OVERRIDES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".m4v": "video/mp4",
+    ".flv": "video/x-flv",
+    ".wmv": "video/x-ms-wmv",
+    ".ts": "video/mp2t",
+    ".3gp": "video/3gpp",
+    ".ogg": "video/ogg",
+    ".ogv": "video/ogg",
+}
+
+
+def resolve_video_content_type(filename_or_path: Union[str, Path], fallback: Optional[str] = None) -> str:
+    """Accurately maps video extension to IANA media type, falling back to mimetypes or provided type."""
+    ext = Path(filename_or_path).suffix.lower()
+    if ext in MIME_TYPE_OVERRIDES:
+        return MIME_TYPE_OVERRIDES[ext]
+    guessed, _ = mimetypes.guess_type(str(filename_or_path))
+    if guessed:
+        return guessed
+    if fallback and fallback not in ("application/octet-stream", ""):
+        return fallback
+    return "video/mp4"
 
 
 SAFE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-]+$")
@@ -203,8 +273,7 @@ def stream_asset_video(asset_id: str):
         target_video = suspect_matches[0].resolve()
         suspect_base = SUSPECTS_VIDEOS_DIR.resolve()
         if target_video.is_relative_to(suspect_base) and target_video.is_file():
-            ext = target_video.suffix.lower()
-            media_type = "video/mp4" if ext == ".mp4" else f"video/{ext.lstrip('.')}"
+            media_type = resolve_video_content_type(target_video)
             return FileResponse(str(target_video), media_type=media_type)
 
     if is_cloud_mode():
@@ -237,8 +306,7 @@ def stream_asset_video(asset_id: str):
     if not target_video.is_file():
         raise HTTPException(status_code=404, detail="Video file not found.")
 
-    ext = target_video.suffix.lower()
-    media_type = "video/mp4" if ext == ".mp4" else f"video/{ext.lstrip('.')}"
+    media_type = resolve_video_content_type(target_video)
     return FileResponse(str(target_video), media_type=media_type)
 
 
@@ -375,13 +443,14 @@ async def ingest_reference_video(
         )
 
         # 5. Handle Ingestion according to Storage Mode
+        resolved_content_type = resolve_video_content_type(file.filename, fallback=file.content_type)
         if is_cloud_mode():
             from app.cloud_ingest import ingest_reference_asset_cloud
             return ingest_reference_asset_cloud(
                 asset_id=asset_id,
                 video_path=target_path,
                 original_filename=file.filename,
-                content_type=file.content_type or "video/mp4",
+                content_type=resolved_content_type,
                 duration_seconds=duration_sec,
                 extracted_frames=extracted_frames,
                 frames_dir=asset_frames_dir,
@@ -406,7 +475,7 @@ async def ingest_reference_video(
             filename=file.filename,
             stored_filename=stored_filename,
             file_size=total_bytes,
-            content_type=file.content_type or "video/mp4",
+            content_type=resolved_content_type,
             duration_seconds=duration_sec,
             frame_count=len(extracted_frames),
             frames=extracted_frames,
@@ -418,7 +487,7 @@ async def ingest_reference_video(
             "asset_id": asset_id,
             "filename": file.filename,
             "file_size": total_bytes,
-            "content_type": file.content_type,
+            "content_type": resolved_content_type,
             "duration_seconds": duration_sec,
             "frame_count": len(extracted_frames),
             "sample_interval_seconds": 5,
@@ -562,6 +631,41 @@ async def scan_suspect_video(
         await file.close()
 
 
+@app.post("/api/threats/screen-url")
+def screen_video_url_endpoint(payload: ScreenUrlRequest):
+    """
+    Screens a public video URL by extracting metadata and public thumbnail,
+    verifying SSRF protection, and matching the thumbnail against the FAISS reference vault.
+    NEVER downloads the underlying third-party video stream.
+    """
+    raw_url = (payload.url or "").strip()
+    if not raw_url:
+        raise HTTPException(status_code=400, detail="Video URL is required.")
+
+    try:
+        result = screen_video_url(raw_url, vault=default_vault)
+        return result
+    except SSRFValidationError as sve:
+        raise HTTPException(status_code=400, detail=f"SSRF validation blocked: {sve}")
+    except UnsupportedPlatformError as upe:
+        raise HTTPException(status_code=422, detail=f"Unsupported platform: {upe}")
+    except MetadataExtractionError as mee:
+        raise HTTPException(status_code=422, detail=f"Metadata extraction failed: {mee}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to screen video URL: {e}")
+
+
+@app.get("/api/threats/suspect-thumbnail/{incident_id}")
+def get_suspect_thumbnail_endpoint(incident_id: str):
+    """Serves the cached suspect thumbnail image for UI preview."""
+    if not SAFE_ID_REGEX.match(incident_id):
+        raise HTTPException(status_code=400, detail="Invalid incident ID format.")
+    thumb_path = SUSPECTS_THUMBNAILS_DIR / f"{incident_id}.jpg"
+    if not thumb_path.exists():
+        raise HTTPException(status_code=404, detail="Suspect thumbnail image not found.")
+    return FileResponse(thumb_path, media_type="image/jpeg")
+
+
 @app.get("/api/incidents")
 def get_incidents_list():
     """Returns recorded threat scan incidents."""
@@ -575,6 +679,70 @@ def get_single_incident(incident_id: str):
         if inc.get("incident_id") == incident_id:
             return inc
     raise HTTPException(status_code=404, detail="Incident not found.")
+
+
+@app.post("/api/threats/{incident_id}/investigate")
+def investigate_threat_incident(
+    incident_id: str,
+    payload: Optional[InvestigateIncidentRequest] = None,
+):
+    """
+    Executes a bounded, evidence-grounded Nemotron investigation for an incident.
+    Clusters CV frame matches into coherent timeline intervals and generates
+    a structured investigation report with verified evidence references.
+    """
+    if not SAFE_ID_REGEX.match(incident_id):
+        raise HTTPException(status_code=400, detail="Invalid incident ID format.")
+
+    force_refresh = payload.force_refresh if payload else False
+    model_override = payload.model_override if payload else None
+
+    # Check for existing report if not forcing refresh
+    if not force_refresh:
+        existing_reports = get_nemotron_reports_for_incident(incident_id)
+        if existing_reports:
+            return existing_reports[0]
+
+    incident = get_incident_by_id(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found.")
+
+    frames_ev = build_frame_evidence_from_matches(incident.get("frame_matches") or [])
+    intervals = cluster_frame_matches(frames_ev)
+    investigation_input = build_investigation_input_from_incident(incident, intervals)
+
+    report = generate_nemotron_report(investigation_input, model_override=model_override)
+    try:
+        saved_record = save_nemotron_report(report)
+        return saved_record
+    except Exception as e:
+        # Document persistence error in operational metadata and return
+        rep_dict = report.model_dump(mode="json")
+        rep_dict.setdefault("operational_metadata", {}).setdefault("errors", []).append(f"Persistence error: {e}")
+        return rep_dict
+
+
+@app.get("/api/threats/{incident_id}/report")
+def get_incident_latest_report(incident_id: str):
+    """Retrieves the latest generated Nemotron report for a threat incident."""
+    if not SAFE_ID_REGEX.match(incident_id):
+        raise HTTPException(status_code=400, detail="Invalid incident ID format.")
+    reports = get_nemotron_reports_for_incident(incident_id)
+    if not reports:
+        raise HTTPException(status_code=404, detail="No investigation report found for this incident.")
+    return reports[0]
+
+
+@app.get("/api/threats/reports/{report_id}")
+def get_report_by_id_endpoint(report_id: str):
+    """Retrieves a specific Nemotron investigation report by report_id."""
+    if not SAFE_ID_REGEX.match(report_id):
+        raise HTTPException(status_code=400, detail="Invalid report ID format.")
+    report = get_nemotron_report_by_id(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+    return report
+
 
 
 

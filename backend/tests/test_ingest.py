@@ -177,6 +177,55 @@ class TestIngestAndExtraction(unittest.TestCase):
             if os.path.exists(synth_video_path):
                 os.remove(synth_video_path)
 
+    def test_ingest_non_mp4_video_formats(self):
+        """
+        Verify that non-MP4 formats (such as .avi and .webm) are successfully ingested,
+        extracted at 5s intervals, correctly content-typed, and stored with their original extensions.
+        """
+        # Create an 11s AVI video using MJPG or XVID codec
+        tmp = tempfile.NamedTemporaryFile(suffix=".avi", delete=False)
+        avi_path = tmp.name
+        tmp.close()
+
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        out = cv2.VideoWriter(avi_path, fourcc, 10.0, (320, 240))
+        for i in range(110):
+            img = np.zeros((240, 320, 3), dtype=np.uint8)
+            img[:] = (50, i * 2 % 255, 120)
+            out.write(img)
+        out.release()
+
+        try:
+            with open(avi_path, "rb") as f:
+                response = self.client.post(
+                    "/api/vault/ingest",
+                    files={"file": ("reference_clip.avi", f, "video/x-msvideo")},
+                )
+
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertEqual(data["status"], "uploaded")
+            self.assertEqual(data["filename"], "reference_clip.avi")
+            self.assertEqual(data["content_type"], "video/x-msvideo")
+            self.assertEqual(data["frame_count"], 3)
+            asset_id = data["asset_id"]
+            self.created_asset_ids.append(asset_id)
+
+            # Verify stored video preserves extension
+            stored_video = STORAGE_DIR / f"{asset_id}.avi"
+            self.assertTrue(stored_video.exists(), f"Stored AVI missing: {stored_video}")
+
+            # Verify asset is listed properly in registered assets
+            list_res = self.client.get("/api/vault/assets")
+            self.assertEqual(list_res.status_code, 200)
+            assets = list_res.json()
+            matching = [a for a in assets if a["asset_id"] == asset_id]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0]["filename"], "reference_clip.avi")
+        finally:
+            if os.path.exists(avi_path):
+                os.remove(avi_path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,13 +62,18 @@ export const FlipWords = ({
 
 // ─── COBE Globe ─────────────────────────────────────────────────────────────
 export const CobeGlobe = () => {
+  const [mounted, setMounted] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const globeRef = useRef<any>(null);
   const phiRef = useRef(0);
   const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!canvasRef.current) return;
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mounted || !canvasRef.current) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const size = 600;
 
@@ -114,7 +119,11 @@ export const CobeGlobe = () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       globeRef.current?.destroy();
     };
-  }, []);
+  }, [mounted]);
+
+  if (!mounted) {
+    return <div style={{ width: 600, height: 600 }} />;
+  }
 
   return <canvas ref={canvasRef} style={{ width: 600, height: 600 }} />;
 };

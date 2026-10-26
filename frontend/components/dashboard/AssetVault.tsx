@@ -266,7 +266,7 @@ export const AssetVault: React.FC<AssetVaultProps> = ({
             <input
               ref={fileInputRef}
               type="file"
-              accept=".mp4,.mov,.avi,.mkv,.webm"
+              accept=".mp4,.mov,.avi,.mkv,.webm,.m4v,.flv,.wmv,.ts,.3gp,.ogg,.ogv,video/*"
               onChange={handleFileChange}
               className="hidden"
             />
@@ -289,7 +289,7 @@ export const AssetVault: React.FC<AssetVaultProps> = ({
                   Click to select reference video or drag and drop
                 </p>
                 <p className="text-[11px] text-slate-400 mt-1">
-                  Supported formats: MP4, MOV, AVI, MKV, WEBM (Max 50 MB)
+                  Supported formats: MP4, MOV, AVI, MKV, WEBM, M4V, FLV, WMV, TS (Max 50 MB)
                 </p>
               </div>
             )}

@@ -166,13 +166,31 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                     className="p-3.5 rounded-xl transition-all hover:bg-slate-800"
                   >
                     <div className="flex items-center justify-between mb-1.5">
-                      <span
-                        style={{ background: statusColor }}
-                        className="px-2 py-0.5 rounded text-[9px] font-extrabold uppercase text-white tracking-wider"
-                      >
-                        {inc.overall_status}
-                      </span>
-                      <span className="text-[10px] text-slate-500 font-mono">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          style={{
+                            background:
+                              inc.overall_status === "CANDIDATE_MATCH"
+                                ? "#ef4444"
+                                : inc.overall_status === "SUSPECT"
+                                ? "#f59e0b"
+                                : inc.overall_status === "NO_REFERENCE_DATA"
+                                ? "#64748b"
+                                : inc.overall_status === "NEEDS_FULL_VIDEO_REVIEW"
+                                ? "#3b82f6"
+                                : "#0d9488",
+                          }}
+                          className="px-2 py-0.5 rounded text-[9px] font-extrabold uppercase text-white tracking-wider"
+                        >
+                          {inc.overall_status.replace(/_/g, " ")}
+                        </span>
+                        {inc.investigation_type === "URL_SCREENING" && (
+                          <span className="px-1.5 py-0.2 rounded text-[8px] font-black uppercase bg-teal-950 text-teal-300 border border-teal-800">
+                            URL
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-[10px] text-slate-500 font-mono" suppressHydrationWarning>
                         {inc.scanned_at ? new Date(inc.scanned_at).toLocaleTimeString() : "Recent"}
                       </span>
                     </div>
@@ -202,16 +220,34 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                     border: "1px solid rgba(255, 255, 255, 0.08)",
                     borderRadius: 18,
                   }}
-                  className="p-5"
+                  className="p-5 space-y-3"
                 >
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <div>
-                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                        Incident Dossier
-                      </span>
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                          Incident Dossier
+                        </span>
+                        {selectedIncident.investigation_type === "URL_SCREENING" && (
+                          <span className="px-1.5 py-0.2 rounded text-[8px] font-black uppercase bg-teal-950 text-teal-300 border border-teal-800">
+                            URL Screening
+                          </span>
+                        )}
+                      </div>
                       <h3 className="text-[16px] font-extrabold text-white m-0">
                         {selectedIncident.suspect_filename || selectedIncident.submitted_asset_id}
                       </h3>
+                      {selectedIncident.source_url && (
+                        <a
+                          href={selectedIncident.source_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 text-teal-400 hover:text-teal-300 font-medium text-[11px] mt-1"
+                        >
+                          <span>{selectedIncident.source_url}</span>
+                          <ExternalLink size={12} />
+                        </a>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -224,6 +260,8 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                               ? "rgba(245, 158, 11, 0.2)"
                               : selectedIncident.overall_status === "NO_REFERENCE_DATA"
                               ? "rgba(100, 116, 139, 0.2)"
+                              : selectedIncident.overall_status === "NEEDS_FULL_VIDEO_REVIEW"
+                              ? "rgba(59, 130, 246, 0.2)"
                               : "rgba(13, 148, 136, 0.2)",
                           color:
                             selectedIncident.overall_status === "CANDIDATE_MATCH"
@@ -232,6 +270,8 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                               ? "#fbbf24"
                               : selectedIncident.overall_status === "NO_REFERENCE_DATA"
                               ? "#cbd5e1"
+                              : selectedIncident.overall_status === "NEEDS_FULL_VIDEO_REVIEW"
+                              ? "#60a5fa"
                               : "#2dd4bf",
                         }}
                         className="px-3 py-1 rounded-full text-[11px] font-extrabold uppercase tracking-wide border border-current/20"
@@ -241,11 +281,25 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                     </div>
                   </div>
 
+                  {selectedIncident.investigation_type === "URL_SCREENING" && (
+                    <div className="p-3 rounded-xl bg-amber-950/40 border border-amber-500/30 text-amber-200 space-y-1">
+                      <div className="flex items-center gap-2 font-bold text-[11px] text-amber-300">
+                        <ShieldAlert size={14} className="shrink-0" />
+                        <span>PRELIMINARY THUMBNAIL SCREENING — NOT FULL VIDEO VERIFICATION</span>
+                      </div>
+                      <p className="text-[10px] text-amber-200/90 leading-relaxed m-0">
+                        {selectedIncident.disclaimer}
+                      </p>
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] py-2 border-y border-slate-800">
                     <div>
                       <span className="text-slate-500 block">Total Analyzed</span>
                       <strong className="text-white">
-                        {selectedIncident.total_frames_analyzed} frames
+                        {selectedIncident.investigation_type === "URL_SCREENING"
+                          ? "1 thumbnail"
+                          : `${selectedIncident.total_frames_analyzed} frames`}
                       </strong>
                     </div>
                     <div>
@@ -286,14 +340,18 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                     <div className="space-y-4">
                       {/* Image Comparison Box */}
                       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        {/* Suspect Frame */}
+                        {/* Suspect Frame / Thumbnail */}
                         <div className="space-y-2">
                           <div className="flex items-center justify-between text-[11px]">
                             <span className="font-bold text-amber-400 uppercase">
-                              Suspect Video Frame
+                              {selectedIncident.investigation_type === "URL_SCREENING"
+                                ? "Screened Public Thumbnail"
+                                : "Suspect Video Frame"}
                             </span>
                             <span className="text-slate-400 font-mono">
-                              Timestamp: {selectedFrameMatch.submitted_frame.timestamp_sec}s
+                              {selectedIncident.investigation_type === "URL_SCREENING"
+                                ? `Platform: ${selectedIncident.platform || "Web"}`
+                                : `Timestamp: ${selectedFrameMatch.submitted_frame.timestamp_sec}s`}
                             </span>
                           </div>
                           <div
@@ -301,13 +359,26 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                             className="aspect-video overflow-hidden border border-amber-500/30 flex items-center justify-center"
                           >
                             <img
-                              src={`${API_BASE}/api/vault/assets/${selectedIncident.submitted_asset_id}/frames/${selectedFrameMatch.submitted_frame.filename}`}
-                              alt="Suspect frame"
+                              src={
+                                selectedIncident.investigation_type === "URL_SCREENING"
+                                  ? (selectedIncident.suspect_thumbnail_preview_url
+                                      ? `${API_BASE}${selectedIncident.suspect_thumbnail_preview_url}`
+                                      : selectedIncident.thumbnail_url || "")
+                                  : `${API_BASE}/api/vault/assets/${selectedIncident.submitted_asset_id}/frames/${selectedFrameMatch.submitted_frame.filename}`
+                              }
+                              alt="Suspect frame or thumbnail"
                               className="max-h-full max-w-full object-contain"
+                              onError={(e) => {
+                                if (selectedIncident.thumbnail_url && (e.target as HTMLElement).getAttribute("src") !== selectedIncident.thumbnail_url) {
+                                  (e.target as HTMLImageElement).src = selectedIncident.thumbnail_url;
+                                }
+                              }}
                             />
                           </div>
                           <p className="text-[10px] text-slate-500 font-mono truncate">
-                            {selectedFrameMatch.submitted_frame.filename}
+                            {selectedIncident.investigation_type === "URL_SCREENING"
+                              ? (selectedIncident.metadata?.title || selectedIncident.suspect_filename)
+                              : selectedFrameMatch.submitted_frame.filename}
                           </p>
                         </div>
 

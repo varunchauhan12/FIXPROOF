@@ -21,6 +21,7 @@ VIDEOS_DIR = STORAGE_ROOT / "videos"
 FRAMES_DIR = STORAGE_ROOT / "frames"
 ASSETS_META_FILE = STORAGE_ROOT / "assets_metadata.json"
 INCIDENTS_FILE = STORAGE_ROOT / "incidents.json"
+NEMOTRON_REPORTS_FILE = STORAGE_ROOT / "nemotron_reports.json"
 
 # Ensure directories exist
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -219,18 +220,19 @@ def list_registered_assets(vault: Any) -> List[Dict[str, Any]]:
     asset_list = []
     for asset_id in discovered_ids:
         frames = get_asset_frames_list(asset_id)
-        if not frames and not (VIDEOS_DIR / f"{asset_id}.mp4").exists():
+        video_files = list(VIDEOS_DIR.glob(f"{asset_id}.*"))
+        if not frames and not video_files:
             continue
 
         meta = all_meta.get(asset_id, {})
-        video_files = list(VIDEOS_DIR.glob(f"{asset_id}.*"))
         stored_file = video_files[0] if video_files else None
 
         filename = meta.get("filename")
         if not filename and stored_file:
             filename = stored_file.name
         elif not filename:
-            filename = f"asset_{asset_id[:8]}.mp4"
+            ext = stored_file.suffix if stored_file else ".mp4"
+            filename = f"asset_{asset_id[:8]}{ext}"
 
         file_size = meta.get("file_size")
         if file_size is None and stored_file and stored_file.exists():
@@ -283,6 +285,18 @@ def get_asset_detail(asset_id: str, vault: Any) -> Optional[Dict[str, Any]]:
 def delete_asset_record(asset_id: str, vault: Any) -> bool:
     """Removes an asset from storage, frame cache, and FAISS vault in local or cloud mode."""
     if is_cloud_mode():
+        # Query storage path before deletion
+        row = default_db_manager.fetch_one(
+            "SELECT storage_path FROM reference_assets WHERE asset_id = %s;",
+            (asset_id,),
+        )
+        target_path = None
+        if row and row.get("storage_path"):
+            sp = row["storage_path"]
+            target_path = sp[len("reference-assets/"):] if sp.startswith("reference-assets/") else sp
+        if not target_path:
+            target_path = f"{asset_id}/{asset_id}.mp4"
+
         # 1. Delete asset from PostgreSQL (foreign keys cascade to reference_frames & reference_vectors)
         default_db_manager.execute("DELETE FROM reference_assets WHERE asset_id = %s;", (asset_id,))
 
@@ -290,7 +304,7 @@ def delete_asset_record(asset_id: str, vault: Any) -> bool:
         try:
             from app.storage import SupabaseStorageClient
             storage_client = SupabaseStorageClient()
-            storage_client.delete_object("reference-assets", f"{asset_id}/{asset_id}.mp4")
+            storage_client.delete_object("reference-assets", target_path)
         except Exception as e:
             logger.warning(f"[Registry] Could not delete cloud storage object for asset {asset_id}: {e}")
 
@@ -371,7 +385,7 @@ def load_incidents() -> List[Dict[str, Any]]:
     if is_cloud_mode():
         rows = default_db_manager.fetch_all(
             """
-            SELECT incident_id, investigation_type, suspect_filename, file_size_bytes,
+            SELECT incident_id, investigation_type, suspect_filename, suspect_url, file_size_bytes,
                    duration_seconds, total_frames_analyzed, candidate_matches_found,
                    highest_confidence, lowest_l2_distance, overall_status,
                    matched_asset_ids, cv_evidence_dossier, scanned_at
@@ -405,10 +419,23 @@ def load_incidents() -> List[Dict[str, Any]]:
             else:
                 scanned_at_str = ""
 
+            s_url = row.get("suspect_url") or dossier.get("source_url") or ""
+            inv_type = row.get("investigation_type") or "FULL_VIDEO_SCAN"
+
             incidents.append({
                 "incident_id": iid,
+                "investigation_type": inv_type,
                 "submitted_asset_id": dossier.get("submitted_asset_id") or iid,
                 "suspect_filename": row.get("suspect_filename") or "",
+                "suspect_url": s_url,
+                "source_url": s_url,
+                "platform": dossier.get("platform") or "",
+                "metadata": dossier.get("metadata") or {},
+                "thumbnail_url": dossier.get("thumbnail_url") or "",
+                "suspect_thumbnail_preview_url": dossier.get("suspect_thumbnail_preview_url") or "",
+                "recommended_action": dossier.get("recommended_action") or ("NEEDS_FULL_VIDEO_REVIEW" if row.get("overall_status") in ("CANDIDATE_MATCH", "SUSPECT", "NEEDS_FULL_VIDEO_REVIEW") else "MONITOR"),
+                "status_message": dossier.get("status_message") or "",
+                "limitations": dossier.get("limitations") or [],
                 "disclaimer": dossier.get("disclaimer", "Candidate visual similarity only; not a definitive copyright-infringement finding."),
                 "total_frames_analyzed": int(row.get("total_frames_analyzed") or 0),
                 "candidate_matches_found": int(row.get("candidate_matches_found") or 0),
@@ -439,6 +466,7 @@ def save_incident(incident_data: Dict[str, Any]) -> None:
     """Appends an incident to the persistent incidents log (local JSON or Supabase PostgreSQL)."""
     if is_cloud_mode():
         iid = str(incident_data.get("incident_id") or uuid.uuid4())
+        inv_type = incident_data.get("investigation_type", "FULL_VIDEO_SCAN")
         raw_matched = incident_data.get("matched_assets", [])
         matched_ids = []
         for ma in raw_matched:
@@ -449,10 +477,20 @@ def save_incident(incident_data: Dict[str, Any]) -> None:
             elif ma:
                 matched_ids.append(str(ma))
 
+        suspect_url = incident_data.get("suspect_url") or incident_data.get("source_url")
+
         dossier = {
             "frame_matches": incident_data.get("frame_matches", []),
-            "submitted_asset_id": incident_data.get("submitted_asset_id"),
+            "submitted_asset_id": incident_data.get("submitted_asset_id") or iid,
             "disclaimer": incident_data.get("disclaimer", "Candidate visual similarity only; not a definitive copyright-infringement finding."),
+            "source_url": suspect_url,
+            "platform": incident_data.get("platform"),
+            "metadata": incident_data.get("metadata"),
+            "thumbnail_url": incident_data.get("thumbnail_url"),
+            "suspect_thumbnail_preview_url": incident_data.get("suspect_thumbnail_preview_url"),
+            "recommended_action": incident_data.get("recommended_action"),
+            "limitations": incident_data.get("limitations"),
+            "status_message": incident_data.get("status_message"),
         }
 
         conf = min(100.0, max(0.0, float(incident_data.get("highest_confidence") or 0.0)))
@@ -473,13 +511,15 @@ def save_incident(incident_data: Dict[str, Any]) -> None:
         default_db_manager.execute(
             """
             INSERT INTO incidents (
-                incident_id, investigation_type, suspect_filename, file_size_bytes,
+                incident_id, investigation_type, suspect_filename, suspect_url, file_size_bytes,
                 duration_seconds, total_frames_analyzed, candidate_matches_found,
                 highest_confidence, lowest_l2_distance, overall_status,
                 matched_asset_ids, cv_evidence_dossier, scanned_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (incident_id) DO UPDATE SET
+                investigation_type = EXCLUDED.investigation_type,
                 suspect_filename = EXCLUDED.suspect_filename,
+                suspect_url = EXCLUDED.suspect_url,
                 file_size_bytes = EXCLUDED.file_size_bytes,
                 duration_seconds = EXCLUDED.duration_seconds,
                 total_frames_analyzed = EXCLUDED.total_frames_analyzed,
@@ -493,8 +533,9 @@ def save_incident(incident_data: Dict[str, Any]) -> None:
             """,
             (
                 iid,
-                "FULL_VIDEO_SCAN",
+                inv_type,
                 suspect_name,
+                suspect_url,
                 file_size,
                 dur_val,
                 frames_count,
@@ -507,7 +548,7 @@ def save_incident(incident_data: Dict[str, Any]) -> None:
                 scanned_at,
             ),
         )
-        logger.info(f"[Registry] Saved incident {iid} to Supabase PostgreSQL.")
+        logger.info(f"[Registry] Saved incident {iid} ({inv_type}) to Supabase PostgreSQL.")
         return
 
     # Local mode: append to incidents.json
@@ -519,3 +560,191 @@ def save_incident(incident_data: Dict[str, Any]) -> None:
             json.dump(incidents, f, indent=2)
     except Exception as e:
         logger.error(f"[Registry] Failed to write {INCIDENTS_FILE}: {e}")
+        raise
+
+
+def get_incident_by_id(incident_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves an incident record by its incident_id."""
+    for inc in load_incidents():
+        if str(inc.get("incident_id")) == str(incident_id):
+            return inc
+    return None
+
+
+def load_nemotron_reports() -> List[Dict[str, Any]]:
+    """Loads all persisted Nemotron reports from local JSON or Supabase PostgreSQL."""
+    if is_cloud_mode():
+        try:
+            rows = default_db_manager.fetch_all(
+                """
+                SELECT report_id, incident_id, model_id, prompt_version, summary,
+                       recommended_action, confidence_assessment, human_review_required,
+                       contradictions_detected, limitations_disclosed, full_report_json,
+                       raw_model_response, prompt_tokens, completion_tokens, latency_ms, created_at
+                FROM nemotron_reports
+                ORDER BY created_at DESC;
+                """
+            )
+            reports = []
+            for row in rows:
+                full_json = row.get("full_report_json")
+                if isinstance(full_json, str):
+                    try:
+                        full_json = json.loads(full_json)
+                    except Exception:
+                        pass
+                if isinstance(full_json, dict):
+                    full_json["report_id"] = str(row["report_id"])
+                    full_json["incident_id"] = str(row["incident_id"])
+                    reports.append(full_json)
+                else:
+                    reports.append({
+                        "report_id": str(row["report_id"]),
+                        "incident_id": str(row["incident_id"]),
+                        "model_id": row["model_id"],
+                        "prompt_version": row["prompt_version"],
+                        "summary": row["summary"],
+                        "recommended_action": row["recommended_action"],
+                        "confidence_assessment": row["confidence_assessment"],
+                        "human_review_required": row["human_review_required"],
+                        "contradictions_detected": row.get("contradictions_detected") or [],
+                        "limitations_disclosed": row.get("limitations_disclosed") or [],
+                        "created_at": str(row.get("created_at") or ""),
+                    })
+            return reports
+        except Exception as e:
+            logger.error(f"[Registry] Failed to load nemotron reports from cloud DB: {e}")
+            raise
+
+    # Local mode: read from nemotron_reports.json
+    if not NEMOTRON_REPORTS_FILE.exists():
+        return []
+    try:
+        with open(NEMOTRON_REPORTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"[Registry] Failed to read {NEMOTRON_REPORTS_FILE}: {e}")
+        return []
+
+
+def save_nemotron_report(report_data: Any) -> Dict[str, Any]:
+    """
+    Persists a validated Nemotron investigation report in local JSON or Supabase PostgreSQL.
+    
+    Guarantees:
+    - Never masks database errors; explicitly raises on persistence failure.
+    - Preserves exact report structure in full_report_json.
+    - Rejects or strips private internal reasoning traces.
+    """
+    if hasattr(report_data, "model_dump"):
+        record = report_data.model_dump(mode="json")
+    elif isinstance(report_data, dict):
+        record = dict(report_data)
+    else:
+        raise ValueError("report_data must be an InvestigationReport instance or dictionary.")
+
+    rid = str(record.get("report_id") or uuid.uuid4())
+    iid = str(record.get("incident_id"))
+    record["report_id"] = rid
+
+    if is_cloud_mode():
+        model_id = str(record.get("model_id") or "nvidia/Nemotron-3_5-Lightning")
+        prompt_ver = str(record.get("prompt_version") or "v1.0")
+        summary = str(record.get("summary") or "")
+        rec_action = str(record.get("recommended_action") or "NEEDS_FULL_VIDEO_REVIEW")
+        conf_assess = str(record.get("confidence_assessment") or "INCONCLUSIVE_DATA")
+        human_req = bool(record.get("human_review_required", False))
+        contradictions = record.get("contradictions_detected") or []
+        limitations = record.get("limitations_disclosed") or []
+
+        op_meta = record.get("operational_metadata") or {}
+        p_tokens = op_meta.get("prompt_tokens")
+        c_tokens = op_meta.get("completion_tokens")
+        lat_ms = op_meta.get("latency_ms")
+        created_at = op_meta.get("created_at") or datetime.now(timezone.utc).isoformat()
+
+        try:
+            default_db_manager.execute(
+                """
+                INSERT INTO nemotron_reports (
+                    report_id, incident_id, model_id, prompt_version, summary,
+                    recommended_action, confidence_assessment, human_review_required,
+                    contradictions_detected, limitations_disclosed, full_report_json,
+                    raw_model_response, prompt_tokens, completion_tokens, latency_ms, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (report_id) DO UPDATE SET
+                    summary = EXCLUDED.summary,
+                    recommended_action = EXCLUDED.recommended_action,
+                    confidence_assessment = EXCLUDED.confidence_assessment,
+                    human_review_required = EXCLUDED.human_review_required,
+                    contradictions_detected = EXCLUDED.contradictions_detected,
+                    limitations_disclosed = EXCLUDED.limitations_disclosed,
+                    full_report_json = EXCLUDED.full_report_json,
+                    raw_model_response = EXCLUDED.raw_model_response,
+                    prompt_tokens = EXCLUDED.prompt_tokens,
+                    completion_tokens = EXCLUDED.completion_tokens,
+                    latency_ms = EXCLUDED.latency_ms;
+                """,
+                (
+                    rid,
+                    iid,
+                    model_id,
+                    prompt_ver,
+                    summary,
+                    rec_action,
+                    conf_assess,
+                    human_req,
+                    json.dumps(contradictions),
+                    json.dumps(limitations),
+                    json.dumps(record),
+                    summary,  # safe concise text representation (no private reasoning)
+                    int(p_tokens) if p_tokens is not None else None,
+                    int(c_tokens) if c_tokens is not None else None,
+                    int(lat_ms) if lat_ms is not None else None,
+                    created_at,
+                ),
+            )
+            logger.info(f"[Registry] Saved Nemotron report {rid} for incident {iid} in Supabase DB.")
+            return record
+        except Exception as e:
+            logger.error(f"[Registry] Failed to save Nemotron report {rid} in cloud DB: {e}")
+            raise
+
+    # Local mode: persist to storage/nemotron_reports.json
+    reports = load_nemotron_reports()
+    # Replace existing report if same report_id, or prepend
+    replaced = False
+    for idx, rep in enumerate(reports):
+        if rep.get("report_id") == rid:
+            reports[idx] = record
+            replaced = True
+            break
+    if not replaced:
+        reports.insert(0, record)
+
+    try:
+        with open(NEMOTRON_REPORTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(reports, f, indent=2)
+        logger.info(f"[Registry] Persisted Nemotron report {rid} to {NEMOTRON_REPORTS_FILE}.")
+        return record
+    except Exception as e:
+        logger.error(f"[Registry] Failed to write {NEMOTRON_REPORTS_FILE}: {e}")
+        raise
+
+
+def get_nemotron_report_by_id(report_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a single Nemotron report by its report_id."""
+    for rep in load_nemotron_reports():
+        if rep.get("report_id") == str(report_id):
+            return rep
+    return None
+
+
+def get_nemotron_reports_for_incident(incident_id: str) -> List[Dict[str, Any]]:
+    """Retrieves all Nemotron reports generated for a specific incident."""
+    matching = []
+    for rep in load_nemotron_reports():
+        if rep.get("incident_id") == str(incident_id):
+            matching.append(rep)
+    return matching
+

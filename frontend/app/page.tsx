@@ -8,8 +8,10 @@ import { DashboardConsole } from "@/components/dashboard/DashboardConsole";
 export default function RootPage() {
   const router = useRouter();
   const [viewMode, setViewMode] = useState<"landing" | "dashboard">("landing");
+  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
+    setMounted(true);
     // Check if query param ?view=dashboard is passed
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
