@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, RedirectResponse
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -69,15 +69,44 @@ from app.evidence_models import (
     build_investigation_input_from_incident,
 )
 from app.timeline import cluster_frame_matches
-from app.nemotron_engine import generate_nemotron_report
-from typing import Optional
+from app.nemotron_engine import (
+    generate_nemotron_report,
+    get_allowed_models,
+    normalize_model_override,
+    DEFAULT_MODEL,
+)
+from typing import Optional, Dict, Any
 
 class ScreenUrlRequest(BaseModel):
     url: str
 
 class InvestigateIncidentRequest(BaseModel):
-    force_refresh: bool = False
-    model_override: Optional[str] = None
+    force_refresh: bool = Field(
+        default=False,
+        description="If True, bypasses cached reports and executes a fresh model investigation.",
+    )
+    model_override: Optional[str] = Field(
+        default=None,
+        description="Optional model ID override. Leave empty or null to use 'nvidia/Nemotron-3_5-Lightning'. Allowed: nvidia/Nemotron-3_5-Lightning, nvidia/Nemotron-3.5-Super-VL.",
+        json_schema_extra={"example": None},
+    )
+
+
+def is_valid_completed_report(report: Dict[str, Any]) -> bool:
+    """
+    Returns True only if the report was successfully generated and validated.
+    Failed/incomplete reports (PROVIDER_API_ERROR, FAILED_VALIDATION, etc.) must not
+    act as cache hits for subsequent investigation requests.
+    """
+    op_meta = report.get("operational_metadata") or {}
+    validation_status = op_meta.get("validation_status")
+    failure_type = op_meta.get("failure_type")
+    if validation_status == "FAILED_VALIDATION" or failure_type is not None:
+        return False
+    if not report.get("findings") and "Investigation incomplete" in (report.get("summary") or ""):
+        return False
+    return True
+
 
 
 # Storage directory for official reference videos and extracted frames
@@ -695,13 +724,32 @@ def investigate_threat_incident(
         raise HTTPException(status_code=400, detail="Invalid incident ID format.")
 
     force_refresh = payload.force_refresh if payload else False
-    model_override = payload.model_override if payload else None
+    raw_model = payload.model_override if payload else None
 
-    # Check for existing report if not forcing refresh
+    # Normalize Swagger placeholder ('string') and empty strings
+    normalized_model = normalize_model_override(raw_model)
+    allowed_models = get_allowed_models()
+    if normalized_model is not None and normalized_model not in allowed_models:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid model_override '{raw_model}'. "
+                f"Allowed models: {sorted(allowed_models)}"
+            ),
+        )
+
+    target_model = normalized_model or os.getenv("NEBIUS_MODEL", DEFAULT_MODEL)
+
+    # Check for existing valid report if not forcing refresh
     if not force_refresh:
         existing_reports = get_nemotron_reports_for_incident(incident_id)
-        if existing_reports:
-            return existing_reports[0]
+        valid_reports = [
+            r
+            for r in existing_reports
+            if is_valid_completed_report(r) and (normalized_model is None or r.get("model_id") == target_model)
+        ]
+        if valid_reports:
+            return valid_reports[0]
 
     incident = get_incident_by_id(incident_id)
     if not incident:
@@ -711,7 +759,7 @@ def investigate_threat_incident(
     intervals = cluster_frame_matches(frames_ev)
     investigation_input = build_investigation_input_from_incident(incident, intervals)
 
-    report = generate_nemotron_report(investigation_input, model_override=model_override)
+    report = generate_nemotron_report(investigation_input, model_override=normalized_model)
     try:
         saved_record = save_nemotron_report(report)
         return saved_record

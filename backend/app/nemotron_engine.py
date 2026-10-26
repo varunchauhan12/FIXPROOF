@@ -37,8 +37,62 @@ logger = logging.getLogger(__name__)
 PROMPT_VERSION = "v1.0"
 DEFAULT_MODEL = "nvidia/Nemotron-3_5-Lightning"
 DEFAULT_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
-DEFAULT_TIMEOUT_SEC = 45.0
-DEFAULT_MAX_TOKENS = 6144
+DEFAULT_TIMEOUT_SEC = 90.0
+DEFAULT_MAX_TOKENS = 16384
+
+ALLOWED_MODELS: Set[str] = {
+    "nvidia/Nemotron-3_5-Lightning",
+    "nvidia/Nemotron-3.5-Super-VL",
+}
+
+SWAGGER_PLACEHOLDERS: Set[str] = {
+    "string",
+    "<string>",
+    "null",
+    "none",
+    "undefined",
+}
+
+
+def get_allowed_models() -> Set[str]:
+    """Returns the set of valid Nemotron models, including any configured via NEBIUS_MODEL."""
+    allowed = set(ALLOWED_MODELS)
+    env_model = os.getenv("NEBIUS_MODEL")
+    if env_model and env_model.strip():
+        allowed.add(env_model.strip())
+    return allowed
+
+
+def normalize_model_override(raw: Optional[str]) -> Optional[str]:
+    """
+    Normalizes a model override string.
+    Returns None if raw is None, empty, whitespace-only, or a Swagger placeholder ('string').
+    """
+    if raw is None:
+        return None
+    val = raw.strip()
+    if not val or val.lower() in SWAGGER_PLACEHOLDERS:
+        return None
+    return val
+
+
+def resolve_model_id(model_override: Optional[str] = None) -> str:
+    """
+    Resolves and validates the model ID.
+    - If model_override is absent, blank, or placeholder, returns configured default.
+    - If a nonempty model_override is provided, validates against the allowed model set.
+    - Raises ValueError if an invalid model is explicitly requested.
+    """
+    normalized = normalize_model_override(model_override)
+    if not normalized:
+        return os.getenv("NEBIUS_MODEL", DEFAULT_MODEL)
+    allowed = get_allowed_models()
+    if normalized not in allowed:
+        raise ValueError(
+            f"Invalid model override '{model_override}'. Allowed models: {sorted(allowed)}"
+        )
+    return normalized
+
 
 VALID_ACTIONS: Set[RecommendedAction] = {
     "ESCALATE_LEGAL_TAKEDOWN",
@@ -226,13 +280,22 @@ def generate_nemotron_report(
     - Rejects references to nonexistent evidence.
     - Returns explicit failed report on network, timeout, or schema errors.
     """
-    model_id = model_override or os.getenv("NEBIUS_MODEL", DEFAULT_MODEL)
+    try:
+        model_id = resolve_model_id(model_override)
+    except ValueError as ve:
+        logger.error(f"[NemotronEngine] Invalid model requested: {ve}")
+        return build_failed_report(
+            input_data,
+            model_override or "invalid_model",
+            "INVALID_MODEL_OVERRIDE",
+            str(ve),
+        )
     max_tokens = max_tokens_override or int(os.getenv("NEBIUS_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
     
     # Enforce minimum max_tokens to prevent reasoning token starvation
-    if max_tokens < 3000:
-        logger.warning(f"[NemotronEngine] max_tokens={max_tokens} is low; bumping to 6144 to prevent reasoning token starvation.")
-        max_tokens = 6144
+    if max_tokens < 8192:
+        logger.warning(f"[NemotronEngine] max_tokens={max_tokens} is low; bumping to 16384 to prevent reasoning token starvation.")
+        max_tokens = 16384
 
     # Collect all valid evidence IDs from input
     valid_ids: Set[str] = set()

@@ -57,6 +57,10 @@ from app.nemotron_engine import (
     build_user_prompt,
     SYSTEM_PROMPT,
     DEFAULT_MODEL,
+    normalize_model_override,
+    resolve_model_id,
+    ALLOWED_MODELS,
+    get_allowed_models,
 )
 from app import registry
 from app.main import app
@@ -686,6 +690,230 @@ class TestReportPersistenceAndCompatibility(unittest.TestCase):
                 resp_404 = self.client.post("/api/threats/nonexistent-id/investigate")
                 self.assertEqual(resp_404.status_code, 404)
 
+    def test_13_model_override_normalization_and_validation(self):
+        """13. Regression test: Verify normalization and resolution for omitted, null, empty, placeholder, valid, and invalid overrides."""
+        # 1. Normalization of blank, absent, and Swagger placeholder overrides
+        self.assertIsNone(normalize_model_override(None))
+        self.assertIsNone(normalize_model_override(""))
+        self.assertIsNone(normalize_model_override("   "))
+        self.assertIsNone(normalize_model_override("string"))
+        self.assertIsNone(normalize_model_override("String"))
+        self.assertIsNone(normalize_model_override("<string>"))
+        self.assertIsNone(normalize_model_override("null"))
+        self.assertIsNone(normalize_model_override("none"))
+        self.assertIsNone(normalize_model_override("undefined"))
+
+        # Valid model strings are preserved
+        self.assertEqual(normalize_model_override("nvidia/Nemotron-3_5-Lightning"), "nvidia/Nemotron-3_5-Lightning")
+        self.assertEqual(normalize_model_override("nvidia/Nemotron-3.5-Super-VL"), "nvidia/Nemotron-3.5-Super-VL")
+
+        # 2. Resolution: Absent or placeholder defaults to configured default model
+        self.assertEqual(resolve_model_id(None), DEFAULT_MODEL)
+        self.assertEqual(resolve_model_id(""), DEFAULT_MODEL)
+        self.assertEqual(resolve_model_id("   "), DEFAULT_MODEL)
+        self.assertEqual(resolve_model_id("string"), DEFAULT_MODEL)
+        self.assertEqual(resolve_model_id("<string>"), DEFAULT_MODEL)
+        self.assertEqual(resolve_model_id("null"), DEFAULT_MODEL)
+
+        # Nonempty valid overrides
+        self.assertEqual(resolve_model_id("nvidia/Nemotron-3_5-Lightning"), "nvidia/Nemotron-3_5-Lightning")
+        self.assertEqual(resolve_model_id("nvidia/Nemotron-3.5-Super-VL"), "nvidia/Nemotron-3.5-Super-VL")
+
+        # Nonempty invalid overrides raise ValueError
+        with self.assertRaises(ValueError):
+            resolve_model_id("unsupported-model-xyz")
+
+        # 3. Direct engine call with invalid override returns explicit failed report
+        test_input = InvestigationInput(
+            incident_id="00000000-0000-0000-0000-000000000001",
+            investigation_type="FULL_VIDEO_SCAN",
+            suspect_filename="test.mp4",
+            duration_seconds=10.0,
+            overall_cv_status="CANDIDATE_MATCH",
+            matched_assets=["asset_1"],
+            frames_evidence=[],
+            timeline_intervals=[],
+        )
+        report = generate_nemotron_report(test_input, model_override="invalid-model-foo")
+        self.assertEqual(report.operational_metadata.get("validation_status"), "FAILED_VALIDATION")
+        self.assertEqual(report.operational_metadata.get("failure_type"), "INVALID_MODEL_OVERRIDE")
+        self.assertTrue(report.human_review_required)
+
+    def test_14_api_model_override_scenarios(self):
+        """14. Regression test: Verify API handles omitted, null, empty, Swagger 'string', valid, and invalid model overrides."""
+        test_inc_id = "12345678-0000-0000-0000-123456789abc"
+        mock_incident = {
+            "incident_id": test_inc_id,
+            "investigation_type": "FULL_VIDEO_SCAN",
+            "suspect_filename": "clip.mp4",
+            "overall_status": "CANDIDATE_MATCH",
+            "frame_matches": [],
+        }
+        mock_json_response = json.dumps({
+            "summary": "Verified correspondence.",
+            "recommended_action": "ESCALATE_LEGAL_TAKEDOWN",
+            "confidence_assessment": "HIGH_CONFIDENCE_MATCH",
+            "findings": [],
+            "limitations_disclosed": [],
+            "evidence_references": [],
+        })
+
+        with patch("app.main.is_cloud_mode", return_value=False), \
+             patch("app.registry.is_cloud_mode", return_value=False), \
+             patch("app.main.get_incident_by_id", return_value=mock_incident), \
+             patch("app.nemotron_engine.get_openai_client") as mock_get_client:
+
+            mock_client = MagicMock()
+            mock_get_client.return_value = mock_client
+            mock_client.chat.completions.create.return_value = _create_mock_completion(mock_json_response)
+
+            # Scenario A: Omitted model_override (empty JSON body {})
+            resp = self.client.post(f"/api/threats/{test_inc_id}/investigate", json={"force_refresh": True})
+            self.assertEqual(resp.status_code, 200)
+            call_kwargs = mock_client.chat.completions.create.call_args[1]
+            self.assertEqual(call_kwargs["model"], DEFAULT_MODEL)
+
+            # Scenario B: model_override is null
+            resp = self.client.post(f"/api/threats/{test_inc_id}/investigate", json={"force_refresh": True, "model_override": None})
+            self.assertEqual(resp.status_code, 200)
+            call_kwargs = mock_client.chat.completions.create.call_args[1]
+            self.assertEqual(call_kwargs["model"], DEFAULT_MODEL)
+
+            # Scenario C: model_override is empty string ""
+            resp = self.client.post(f"/api/threats/{test_inc_id}/investigate", json={"force_refresh": True, "model_override": ""})
+            self.assertEqual(resp.status_code, 200)
+            call_kwargs = mock_client.chat.completions.create.call_args[1]
+            self.assertEqual(call_kwargs["model"], DEFAULT_MODEL)
+
+            # Scenario D: model_override is Swagger placeholder "string"
+            resp = self.client.post(f"/api/threats/{test_inc_id}/investigate", json={"force_refresh": True, "model_override": "string"})
+            self.assertEqual(resp.status_code, 200)
+            call_kwargs = mock_client.chat.completions.create.call_args[1]
+            self.assertEqual(call_kwargs["model"], DEFAULT_MODEL)
+
+            # Scenario E: model_override is a valid allowed model
+            resp = self.client.post(f"/api/threats/{test_inc_id}/investigate", json={"force_refresh": True, "model_override": "nvidia/Nemotron-3.5-Super-VL"})
+            self.assertEqual(resp.status_code, 200)
+            call_kwargs = mock_client.chat.completions.create.call_args[1]
+            self.assertEqual(call_kwargs["model"], "nvidia/Nemotron-3.5-Super-VL")
+
+            # Scenario F: model_override is an invalid unsupported model -> 400 Bad Request
+            resp_invalid = self.client.post(f"/api/threats/{test_inc_id}/investigate", json={"model_override": "invalid-model-xyz"})
+            self.assertEqual(resp_invalid.status_code, 400)
+            self.assertIn("Invalid model_override", resp_invalid.json()["detail"])
+            self.assertIn("Allowed models", resp_invalid.json()["detail"])
+
+    def test_15_caching_and_force_refresh_behavior(self):
+        """15. Regression test: Verify failed reports do not block retry, while valid reports are cached unless force_refresh=True."""
+        test_inc_id = "55555555-5555-5555-5555-555555555555"
+        mock_incident = {
+            "incident_id": test_inc_id,
+            "investigation_type": "FULL_VIDEO_SCAN",
+            "suspect_filename": "clip.mp4",
+            "overall_status": "CANDIDATE_MATCH",
+            "frame_matches": [],
+        }
+
+        # 1. Simulate an existing FAILED report in registry (e.g. from previous Swagger "string" failure)
+        failed_report = {
+            "report_id": "failed-rep-123",
+            "incident_id": test_inc_id,
+            "model_id": "string",
+            "summary": "Investigation incomplete: PROVIDER_API_ERROR. The model 'string' does not exist.",
+            "recommended_action": "NEEDS_FULL_VIDEO_REVIEW",
+            "confidence_assessment": "INCONCLUSIVE_DATA",
+            "human_review_required": True,
+            "findings": [],
+            "operational_metadata": {
+                "validation_status": "FAILED_VALIDATION",
+                "failure_type": "PROVIDER_API_ERROR",
+                "errors": ["The model 'string' does not exist."],
+            },
+        }
+
+        mock_json_success = json.dumps({
+            "summary": "Successful fresh analysis.",
+            "recommended_action": "ESCALATE_LEGAL_TAKEDOWN",
+            "confidence_assessment": "HIGH_CONFIDENCE_MATCH",
+            "findings": [],
+            "limitations_disclosed": [],
+            "evidence_references": [],
+        })
+
+        with patch("app.main.is_cloud_mode", return_value=False), \
+             patch("app.registry.is_cloud_mode", return_value=False), \
+             patch("app.main.get_incident_by_id", return_value=mock_incident), \
+             patch("app.main.get_nemotron_reports_for_incident") as mock_get_reports, \
+             patch("app.main.save_nemotron_report") as mock_save, \
+             patch("app.nemotron_engine.get_openai_client") as mock_get_client:
+
+            # Initially, registry only has the failed report
+            mock_get_reports.return_value = [failed_report]
+            mock_client = MagicMock()
+            mock_get_client.return_value = mock_client
+            mock_client.chat.completions.create.return_value = _create_mock_completion(mock_json_success)
+            mock_save.side_effect = lambda rep: rep.model_dump(mode="json") if hasattr(rep, "model_dump") else rep
+
+            # User calls with force_refresh=False and model_override="string" (or null)
+            # The failed report MUST NOT act as a cache hit; it must execute a fresh call!
+            resp = self.client.post(
+                f"/api/threats/{test_inc_id}/investigate",
+                json={"force_refresh": False, "model_override": "string"}
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(mock_client.chat.completions.create.called)
+            data = resp.json()
+            self.assertEqual(data["summary"], "Successful fresh analysis.")
+            self.assertEqual(data["operational_metadata"]["validation_status"], "VALIDATED")
+
+            # Now, simulate that the successful report is in cache
+            valid_report = data
+            mock_get_reports.return_value = [valid_report]
+            mock_client.chat.completions.create.reset_mock()
+
+            # Calling again with force_refresh=False returns the valid cached report without calling API
+            resp_cached = self.client.post(
+                f"/api/threats/{test_inc_id}/investigate",
+                json={"force_refresh": False}
+            )
+            self.assertEqual(resp_cached.status_code, 200)
+            self.assertFalse(mock_client.chat.completions.create.called)
+
+            # Calling with force_refresh=True forces fresh execution even when valid report is cached
+            resp_forced = self.client.post(
+                f"/api/threats/{test_inc_id}/investigate",
+                json={"force_refresh": True}
+            )
+            self.assertEqual(resp_forced.status_code, 200)
+            self.assertTrue(mock_client.chat.completions.create.called)
+
+    def test_16_provider_error_honesty(self):
+        """16. Regression test: Verify provider error is represented honestly and never marked as passed validation."""
+        test_input = InvestigationInput(
+            incident_id="99999999-9999-9999-9999-999999999999",
+            investigation_type="FULL_VIDEO_SCAN",
+            suspect_filename="test.mp4",
+            duration_seconds=10.0,
+            overall_cv_status="CANDIDATE_MATCH",
+            matched_assets=["asset_1"],
+            frames_evidence=[],
+            timeline_intervals=[],
+        )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = APIError(
+            message="The model 'string' does not exist.",
+            request=MagicMock(),
+            body={"error": {"message": "The model 'string' does not exist."}},
+        )
+
+        report = generate_nemotron_report(test_input, client=mock_client, model_override="nvidia/Nemotron-3_5-Lightning")
+        self.assertEqual(report.operational_metadata.get("validation_status"), "FAILED_VALIDATION")
+        self.assertEqual(report.operational_metadata.get("failure_type"), "PROVIDER_API_ERROR")
+        self.assertIn("The model 'string' does not exist.", report.summary)
+        self.assertTrue(report.human_review_required)
+        self.assertEqual(report.confidence_assessment, "INCONCLUSIVE_DATA")
+        self.assertEqual(report.recommended_action, "NEEDS_FULL_VIDEO_REVIEW")
 
 
 if __name__ == "__main__":
