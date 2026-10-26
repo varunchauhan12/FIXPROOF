@@ -315,6 +315,11 @@ class ReferenceVault:
         new_meta: Dict[str, Dict[str, Any]] = {}
 
         for new_vid, (old_vid, meta) in enumerate(remaining_items):
+            if old_vid >= self.vector_db.ntotal:
+                logger.warning(
+                    f"[Vault] Cannot reconstruct vector {old_vid}: index only has {self.vector_db.ntotal} vectors. Skipping."
+                )
+                continue
             vec = self.vector_db.reconstruct(old_vid).reshape(1, -1)
             new_index.add(vec)
             updated_meta = dict(meta)

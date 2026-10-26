@@ -27,7 +27,7 @@ app.add_middleware(
 )
 
 import shutil
-from app.extractor import extract_video_frames
+from app.extractor import extract_video_frames, preflight_video_file
 from app.vault import default_vault
 from app.registry import (
     register_asset,
@@ -282,11 +282,15 @@ async def ingest_reference_video(
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
+        # Lightweight video preflight check before frame directory creation
+        probe_info = preflight_video_file(target_path)
+
         # 4. Extract video frames using MediaGuard sampling logic (1 frame every 5s)
         duration_sec, extracted_frames = extract_video_frames(
             video_path=target_path,
             output_dir=asset_frames_dir,
             sample_interval_sec=5,
+            preflight_info=probe_info,
         )
 
         # 5. Optionally index into the FAISS vault immediately
@@ -402,10 +406,14 @@ async def scan_suspect_video(
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
+        # Lightweight video preflight check before frame directory creation
+        probe_info = preflight_video_file(target_path)
+
         duration_sec, extracted_frames = extract_video_frames(
             video_path=target_path,
             output_dir=suspect_frames_dir,
             sample_interval_sec=5,
+            preflight_info=probe_info,
         )
 
         match_results = analyze_asset_matches(
