@@ -468,7 +468,7 @@ export const AssetVault: React.FC<AssetVaultProps> = ({
       {/* ─── 3. Registered Assets Section ─── */}
       <div>
         <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 flex-wrap">
             <h3 className="text-[15px] font-extrabold text-slate-900 m-0">
               Registered Reference Vault
             </h3>
@@ -482,10 +482,31 @@ export const AssetVault: React.FC<AssetVaultProps> = ({
             >
               {assets.length} official assets
             </span>
+            {vaultStatus?.is_cloud ? (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                Supabase Cloud (PostgreSQL + Storage)
+              </span>
+            ) : (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                Local Mode (Filesystem)
+              </span>
+            )}
           </div>
-          <span className="text-[12px] text-slate-500">
-            {protectedAssets} of {totalAssets} indexed for matching
-          </span>
+          <div className="flex items-center gap-3">
+            <span className="text-[12px] text-slate-500 hidden sm:inline">
+              {protectedAssets} of {totalAssets} indexed for matching
+            </span>
+            <button
+              type="button"
+              onClick={onRefresh}
+              disabled={refreshing}
+              title="Fetch latest library state from backend"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-slate-700 bg-white border border-slate-200 hover:bg-slate-50 transition-colors shadow-sm disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw size={13} className={refreshing ? "animate-spin text-teal-600" : "text-slate-500"} />
+              <span>{refreshing ? "Refreshing..." : "Refresh Library"}</span>
+            </button>
+          </div>
         </div>
 
         {/* Empty State */}

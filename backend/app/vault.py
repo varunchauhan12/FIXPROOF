@@ -10,6 +10,7 @@ Features:
 """
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,8 @@ import torchvision.models as models
 import torchvision.transforms as T
 import faiss
 
+from app.db import get_db_config, default_db_manager
+from app.storage import SupabaseStorageClient, StorageError
 
 logger = logging.getLogger(__name__)
 
@@ -73,26 +76,163 @@ def extract_image_embedding(image: Image.Image) -> np.ndarray:
 class ReferenceVault:
     """
     Manages the FAISS IndexFlatL2 vector database and synchronized metadata store.
+    Supports both local filesystem and Supabase cloud snapshot hydration.
     """
 
-    def __init__(self, vault_dir: Optional[Path] = None):
+    def __init__(self, vault_dir: Optional[Path] = None, mode: Optional[str] = None):
         if vault_dir is None:
             vault_dir = Path(__file__).resolve().parent.parent / "storage" / "vault"
         self.vault_dir = Path(vault_dir)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
 
+        self.cloud_cache_dir = Path(__file__).resolve().parent.parent / "storage" / "cloud_cache" / "vault"
+        self.cloud_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        if mode is not None:
+            self.mode = mode.lower()
+        else:
+            try:
+                self.mode = get_db_config().mode.value
+            except Exception:
+                self.mode = "local"
+
         self.index_path = self.vault_dir / "faiss_vault.index"
         self.meta_path = self.vault_dir / "vault_metadata.json"
+        self.snapshot_version: Optional[int] = None
 
         self.vector_db: faiss.IndexFlatL2 = faiss.IndexFlatL2(EMBEDDING_DIM)
         self.metadata_store: Dict[str, Dict[str, Any]] = {}
 
         self.load_vault()
 
+    @property
+    def is_cloud(self) -> bool:
+        return self.mode in ("supabase", "postgres")
+
+    def reload(self, mode: Optional[str] = None) -> None:
+        """Reloads the vault, optionally switching between local and cloud modes."""
+        if mode is not None:
+            self.mode = mode.lower()
+        else:
+            try:
+                self.mode = get_db_config().mode.value
+            except Exception:
+                self.mode = "local"
+        logger.info(f"[Vault] Reloading reference vault in mode '{self.mode}'...")
+        self.load_vault()
+
+    def _load_cloud_vault(self) -> None:
+        """
+        Hydrates the reference vault from the active Supabase snapshot:
+        1. Queries PostgreSQL vault_snapshots table for the active checkpoint.
+        2. Retrieves the FAISS index and metadata store from private Supabase Storage.
+        3. Strictly validates SHA-256 checksum and vector count.
+        4. Fails fast with clear exceptions on corruption or unavailable storage.
+        """
+        logger.info("[Vault] Fetching active vault snapshot from Supabase PostgreSQL...")
+        db_mgr = default_db_manager
+        if not db_mgr.is_cloud:
+            from app.db import DatabaseConfig, DBMode, DatabaseManager
+            conn_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+            if conn_url:
+                db_mgr = DatabaseManager(DatabaseConfig(mode=DBMode.SUPABASE, connection_url=conn_url))
+        row = db_mgr.fetch_one(
+            """
+            SELECT version_number, total_vectors, total_assets, storage_index_path,
+                   storage_meta_path, sha256_checksum, status
+            FROM vault_snapshots
+            WHERE status = 'ACTIVE'
+            ORDER BY version_number DESC
+            LIMIT 1;
+            """
+        )
+        if not row:
+            raise RuntimeError(
+                "No active FAISS vault snapshot found in PostgreSQL table 'vault_snapshots'. "
+                "Cannot initialize cloud reference vault. Run migration or staging sync first."
+            )
+
+        storage_client = SupabaseStorageClient()
+        bucket = "vault-snapshots"
+
+        idx_storage_path = row["storage_index_path"]
+        if idx_storage_path.startswith(f"{bucket}/"):
+            idx_storage_path = idx_storage_path[len(f"{bucket}/"):]
+
+        meta_storage_path = row["storage_meta_path"]
+        if meta_storage_path.startswith(f"{bucket}/"):
+            meta_storage_path = meta_storage_path[len(f"{bucket}/"):]
+
+        logger.info(f"[Vault] Downloading cloud FAISS snapshot v{row['version_number']} ({idx_storage_path})...")
+        try:
+            index_bytes = storage_client.download_file(bucket, idx_storage_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download cloud FAISS index from '{bucket}/{idx_storage_path}': {e}") from e
+
+        # SHA-256 integrity check against catalog
+        actual_sha256 = hashlib.sha256(index_bytes).hexdigest()
+        expected_sha256 = row["sha256_checksum"]
+        if actual_sha256.lower() != expected_sha256.lower():
+            raise RuntimeError(
+                f"Cloud FAISS snapshot integrity failure! SHA-256 mismatch: "
+                f"expected {expected_sha256}, got {actual_sha256}."
+            )
+
+        logger.info(f"[Vault] Downloading cloud metadata ({meta_storage_path})...")
+        try:
+            meta_bytes = storage_client.download_file(bucket, meta_storage_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to download cloud vault metadata from '{bucket}/{meta_storage_path}': {e}") from e
+
+        # Cache verified snapshot locally in cloud cache
+        cached_idx_path = self.cloud_cache_dir / f"faiss_vault_v{row['version_number']}.index"
+        cached_meta_path = self.cloud_cache_dir / f"vault_metadata_v{row['version_number']}.json"
+
+        cached_idx_path.write_bytes(index_bytes)
+        cached_meta_path.write_bytes(meta_bytes)
+
+        # Load into memory
+        loaded_index = faiss.read_index(str(cached_idx_path))
+        if loaded_index.d != EMBEDDING_DIM:
+            raise RuntimeError(
+                f"Cloud FAISS index dimension mismatch ({loaded_index.d} vs {EMBEDDING_DIM})."
+            )
+        if loaded_index.ntotal != row["total_vectors"]:
+            raise RuntimeError(
+                f"Cloud FAISS index vector count mismatch: expected {row['total_vectors']}, got {loaded_index.ntotal}."
+            )
+
+        loaded_metadata = json.loads(meta_bytes.decode("utf-8"))
+        if loaded_index.ntotal != len(loaded_metadata):
+            logger.warning(
+                f"[Vault] Cloud snapshot vector count mismatch with metadata: "
+                f"Index={loaded_index.ntotal}, Meta={len(loaded_metadata)}"
+            )
+
+        self.vector_db = loaded_index
+        self.metadata_store = loaded_metadata
+        self.index_path = cached_idx_path
+        self.meta_path = cached_meta_path
+        self.snapshot_version = row["version_number"]
+
+        logger.info(
+            f"[Vault] Successfully hydrated cloud reference vault (snapshot v{self.snapshot_version}) "
+            f"with {self.vector_db.ntotal} vectors."
+        )
+
     def load_vault(self) -> None:
-        """Loads existing FAISS index and metadata from disk, initializing safely if absent or corrupt."""
+        """Loads FAISS index and metadata store according to active mode."""
         self.vector_db = faiss.IndexFlatL2(EMBEDDING_DIM)
         self.metadata_store = {}
+
+        if self.is_cloud:
+            self._load_cloud_vault()
+            return
+
+        # Local mode loading
+        self.index_path = self.vault_dir / "faiss_vault.index"
+        self.meta_path = self.vault_dir / "vault_metadata.json"
+        self.snapshot_version = None
 
         # 1. Load FAISS Index
         if self.index_path.exists():
@@ -100,7 +240,7 @@ class ReferenceVault:
                 loaded = faiss.read_index(str(self.index_path))
                 if loaded.d == EMBEDDING_DIM:
                     self.vector_db = loaded
-                    logger.info(f"[Vault] Loaded index with {self.vector_db.ntotal} vectors.")
+                    logger.info(f"[Vault] Loaded local index with {self.vector_db.ntotal} vectors.")
                 else:
                     logger.warning(
                         f"[Vault] Index dim mismatch ({loaded.d} vs {EMBEDDING_DIM}). Initializing fresh index."
@@ -114,7 +254,7 @@ class ReferenceVault:
             try:
                 with open(self.meta_path, "r", encoding="utf-8") as f:
                     self.metadata_store = json.load(f)
-                logger.info(f"[Vault] Loaded metadata with {len(self.metadata_store)} records.")
+                logger.info(f"[Vault] Loaded local metadata with {len(self.metadata_store)} records.")
             except Exception as e:
                 logger.error(f"[Vault] Error loading metadata from {self.meta_path}: {e}. Starting fresh.")
                 self.metadata_store = {}
@@ -261,6 +401,8 @@ class ReferenceVault:
             "indexed_assets": unique_assets,
             "index_file": str(self.index_path),
             "metadata_file": str(self.meta_path),
+            "mode": self.mode,
+            "snapshot_version": self.snapshot_version,
         }
 
     def search_nearest(self, embedding: np.ndarray, k: int = 3) -> Tuple[List[float], List[Dict[str, Any]]]:

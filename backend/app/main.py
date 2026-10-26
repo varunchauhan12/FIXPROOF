@@ -8,9 +8,9 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, RedirectResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -26,9 +26,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_cache_control_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 import shutil
 from app.extractor import extract_video_frames, preflight_video_file
 from app.vault import default_vault
+from app.db import get_db_config, default_db_manager
+from app.storage import SupabaseStorageClient, StorageNotFoundError, StorageError
 from app.registry import (
     register_asset,
     list_registered_assets,
@@ -36,6 +48,7 @@ from app.registry import (
     delete_asset_record,
     load_incidents,
     save_incident,
+    is_cloud_mode,
 )
 
 # Storage directory for official reference videos and extracted frames
@@ -43,6 +56,14 @@ STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage" / "videos"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 FRAMES_DIR = Path(__file__).resolve().parent.parent / "storage" / "frames"
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.on_event("startup")
+def startup_event():
+    """Hydrates reference vault if cloud mode is enabled."""
+    db_cfg = get_db_config()
+    if db_cfg.is_cloud:
+        default_vault.reload(mode=db_cfg.mode.value)
 
 # Isolated storage directory for untrusted suspect videos and frames
 SUSPECTS_DIR = Path(__file__).resolve().parent.parent / "storage" / "suspects"
@@ -77,6 +98,8 @@ def get_vault_status():
     all_assets = list_registered_assets(default_vault)
     status["total_registered_assets"] = len(all_assets)
     status["total_protected_assets"] = sum(1 for a in all_assets if a.get("indexed"))
+    status["db_mode"] = get_db_config().mode.value
+    status["is_cloud"] = is_cloud_mode()
     return status
 
 
@@ -102,28 +125,62 @@ def stream_asset_frame(asset_id: str, frame_filename: str):
     """
     Safely streams an extracted video frame to the client.
     Strictly checks path containment and character safety.
+    In cloud mode, streams from Supabase Storage reference-frames bucket.
     """
     if not SAFE_ID_REGEX.match(asset_id):
         raise HTTPException(status_code=400, detail="Invalid asset ID format.")
     if not SAFE_FRAME_REGEX.match(frame_filename):
         raise HTTPException(status_code=400, detail="Invalid frame filename.")
 
-    frame_path = (FRAMES_DIR / asset_id / frame_filename).resolve()
-    base_dir = FRAMES_DIR.resolve()
-
-    if frame_path.is_relative_to(base_dir) and frame_path.is_file():
-        return FileResponse(
-            str(frame_path),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=3600"},
-        )
-
+    # Check suspect frames directory first
     suspect_frame_path = (SUSPECTS_FRAMES_DIR / asset_id / frame_filename).resolve()
     suspect_base = SUSPECTS_FRAMES_DIR.resolve()
 
     if suspect_frame_path.is_relative_to(suspect_base) and suspect_frame_path.is_file():
         return FileResponse(
             str(suspect_frame_path),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    if is_cloud_mode():
+        cloud_cache_file = (
+            Path(__file__).resolve().parent.parent
+            / "storage"
+            / "cloud_cache"
+            / "frames"
+            / asset_id
+            / frame_filename
+        ).resolve()
+        if cloud_cache_file.is_file():
+            return FileResponse(
+                str(cloud_cache_file),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+
+        try:
+            storage_client = SupabaseStorageClient()
+            frame_bytes = storage_client.download_file("reference-frames", f"{asset_id}/{frame_filename}")
+            cloud_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cloud_cache_file.write_bytes(frame_bytes)
+            return Response(
+                content=frame_bytes,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        except StorageNotFoundError:
+            raise HTTPException(status_code=404, detail="Frame not found in cloud storage.")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to retrieve frame from storage: {e}")
+
+    # Local mode fallback
+    frame_path = (FRAMES_DIR / asset_id / frame_filename).resolve()
+    base_dir = FRAMES_DIR.resolve()
+
+    if frame_path.is_relative_to(base_dir) and frame_path.is_file():
+        return FileResponse(
+            str(frame_path),
             media_type="image/jpeg",
             headers={"Cache-Control": "public, max-age=3600"},
         )
@@ -135,22 +192,46 @@ def stream_asset_frame(asset_id: str, frame_filename: str):
 def stream_asset_video(asset_id: str):
     """
     Safely streams the original uploaded video for an asset.
+    In cloud mode, generates a short-lived authenticated signed URL.
     """
     if not SAFE_ID_REGEX.match(asset_id):
         raise HTTPException(status_code=400, detail="Invalid asset ID format.")
 
+    # Check suspect videos first
+    suspect_matches = list(SUSPECTS_VIDEOS_DIR.glob(f"{asset_id}.*"))
+    if suspect_matches:
+        target_video = suspect_matches[0].resolve()
+        suspect_base = SUSPECTS_VIDEOS_DIR.resolve()
+        if target_video.is_relative_to(suspect_base) and target_video.is_file():
+            ext = target_video.suffix.lower()
+            media_type = "video/mp4" if ext == ".mp4" else f"video/{ext.lstrip('.')}"
+            return FileResponse(str(target_video), media_type=media_type)
+
+    if is_cloud_mode():
+        row = default_db_manager.fetch_one(
+            "SELECT filename, storage_path FROM reference_assets WHERE asset_id = %s",
+            (asset_id,),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Video for asset '{asset_id}' not found.")
+        storage_path = row["storage_path"]
+        bucket = "reference-assets"
+        if storage_path.startswith(f"{bucket}/"):
+            storage_path = storage_path[len(f"{bucket}/"):]
+        try:
+            storage_client = SupabaseStorageClient()
+            signed_url = storage_client.create_signed_url(bucket, storage_path, expires_in=1800)
+            return RedirectResponse(url=signed_url, status_code=307)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to generate streaming URL: {e}")
+
+    # Local mode fallback
     matches = list(STORAGE_DIR.glob(f"{asset_id}.*"))
     base_dir = STORAGE_DIR.resolve()
-
-    if not matches:
-        matches = list(SUSPECTS_VIDEOS_DIR.glob(f"{asset_id}.*"))
-        base_dir = SUSPECTS_VIDEOS_DIR.resolve()
-
     if not matches:
         raise HTTPException(status_code=404, detail=f"Video for asset '{asset_id}' not found.")
 
     target_video = matches[0].resolve()
-
     if not target_video.is_relative_to(base_dir):
         raise HTTPException(status_code=403, detail="Access denied.")
     if not target_video.is_file():
@@ -293,7 +374,22 @@ async def ingest_reference_video(
             preflight_info=probe_info,
         )
 
-        # 5. Optionally index into the FAISS vault immediately
+        # 5. Handle Ingestion according to Storage Mode
+        if is_cloud_mode():
+            from app.cloud_ingest import ingest_reference_asset_cloud
+            return ingest_reference_asset_cloud(
+                asset_id=asset_id,
+                video_path=target_path,
+                original_filename=file.filename,
+                content_type=file.content_type or "video/mp4",
+                duration_seconds=duration_sec,
+                extracted_frames=extracted_frames,
+                frames_dir=asset_frames_dir,
+                vault=default_vault,
+                auto_index=auto_index,
+            )
+
+        # Local Mode: Index into the FAISS vault immediately
         indexed = False
         indexed_records = []
         if auto_index:
@@ -416,12 +512,24 @@ async def scan_suspect_video(
             preflight_info=probe_info,
         )
 
+        if is_cloud_mode() and default_vault.vector_db.ntotal == 0:
+            raise HTTPException(
+                status_code=503,
+                detail="Cloud reference vault is uninitialized or empty. Scanning aborted.",
+            )
+
         match_results = analyze_asset_matches(
             submitted_asset_id=suspect_id,
             frames_dir=suspect_frames_dir,
             vault=default_vault,
             k_candidates=3,
         )
+
+        if is_cloud_mode() and match_results.get("overall_status") == "NO_REFERENCE_DATA":
+            raise HTTPException(
+                status_code=503,
+                detail="Cloud reference vault has no reference data. Scanning cannot produce valid verdict.",
+            )
 
         match_results["suspect_filename"] = file.filename
         match_results["file_size"] = total_bytes

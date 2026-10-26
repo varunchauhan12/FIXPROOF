@@ -64,6 +64,46 @@ def compute_phash_evidence(
     }
 
 
+def load_reference_frame_image(meta: Dict[str, Any]) -> Optional[Image.Image]:
+    """
+    Loads a reference frame PIL image from local disk, or from Supabase Storage
+    when running in cloud mode.
+    """
+    ref_path_str = meta.get("source_frame_path") or meta.get("frame_path")
+    if ref_path_str:
+        ref_path = Path(ref_path_str)
+        if ref_path.exists() and ref_path.is_file():
+            try:
+                return Image.open(ref_path)
+            except Exception as e:
+                logger.warning(f"[Matcher] Could not open local frame {ref_path}: {e}")
+
+    # If running in cloud mode, attempt authenticated retrieval from reference-frames bucket
+    try:
+        from app.db import get_db_config
+        from app.storage import SupabaseStorageClient
+        if get_db_config().is_cloud:
+            asset_id = meta.get("source_asset_id") or meta.get("asset_id")
+            filename = meta.get("source_filename") or meta.get("filename")
+            if asset_id and filename:
+                cloud_cache_file = Path(__file__).resolve().parent.parent / "storage" / "cloud_cache" / "frames" / asset_id / filename
+                if cloud_cache_file.exists():
+                    return Image.open(cloud_cache_file)
+
+                # Download from reference-frames bucket
+                client = SupabaseStorageClient()
+                storage_path = f"{asset_id}/{filename}"
+                frame_bytes = client.download_file("reference-frames", storage_path)
+                cloud_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cloud_cache_file.write_bytes(frame_bytes)
+                import io
+                return Image.open(io.BytesIO(frame_bytes))
+    except Exception as e:
+        logger.warning(f"[Matcher] Could not load cloud reference frame for {meta}: {e}")
+
+    return None
+
+
 def match_single_frame(
     suspect_img: Image.Image,
     submitted_asset_id: str,
@@ -120,13 +160,12 @@ def match_single_frame(
     # Layer 2: pHash cross-check if candidate is within suspect threshold
     phash_evidence = None
     if best["l2_distance"] < SUSPECT_THRESHOLD:
-        ref_path = Path(best.get("source_frame_path", ""))
-        if ref_path.exists():
+        ref_pil = load_reference_frame_image(best)
+        if ref_pil is not None:
             try:
-                with Image.open(ref_path) as ref_pil:
-                    phash_evidence = compute_phash_evidence(suspect_img, ref_pil)
+                phash_evidence = compute_phash_evidence(suspect_img, ref_pil)
             except Exception as e:
-                logger.warning(f"[Matcher] Could not compute pHash against {ref_path}: {e}")
+                logger.warning(f"[Matcher] Could not compute pHash against reference frame: {e}")
 
     best["phash_match"] = phash_evidence["phash_match"] if phash_evidence else False
     best["phash_score"] = phash_evidence["phash_score"] if phash_evidence else 0

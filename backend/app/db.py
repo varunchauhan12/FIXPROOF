@@ -135,23 +135,26 @@ class DatabaseManager:
     """
 
     def __init__(self, config: Optional[DatabaseConfig] = None):
-        self._config = config or get_db_config()
+        self._explicit_config = config
         self._pool: Optional[Any] = None
 
     @property
     def config(self) -> DatabaseConfig:
-        return self._config
+        if self._explicit_config is not None:
+            return self._explicit_config
+        return get_db_config()
 
     @property
     def is_cloud(self) -> bool:
-        return self._config.is_cloud
+        return self.config.is_cloud
 
     def connect(self) -> Any:
         """
         Creates a raw database connection.
         Only valid in cloud mode ('supabase' / 'postgres').
         """
-        if not self._config.is_cloud:
+        cfg = self.config
+        if not cfg.is_cloud:
             raise DatabaseOperationalError(
                 "Direct database connection is not applicable in 'local' mode. "
                 "Local mode utilizes the local JSON registry and filesystem storage."
@@ -160,8 +163,8 @@ class DatabaseManager:
         try:
             import psycopg
             conn = psycopg.connect(
-                self._config.connection_url,
-                connect_timeout=self._config.connection_timeout_sec,
+                cfg.connection_url,
+                connect_timeout=cfg.connection_timeout_sec,
                 autocommit=False,
             )
             return conn
@@ -174,7 +177,7 @@ class DatabaseManager:
             logger.error(f"[Database] Failed to connect to cloud database: {e}")
             # Strict guarantee: never silently fall back to local mode
             raise DatabaseConnectionError(
-                f"Failed to connect to Supabase PostgreSQL ({self._config.mode.value}): {e}"
+                f"Failed to connect to Supabase PostgreSQL ({cfg.mode.value}): {e}"
             ) from e
 
     @contextmanager

@@ -7,6 +7,8 @@ interface HeaderProps {
   title: string;
   backendOnline: boolean;
   vaultSize: number;
+  dbMode?: string;
+  isCloud?: boolean;
   onRefresh?: () => void;
   refreshing?: boolean;
 }
@@ -15,6 +17,8 @@ export const Header: React.FC<HeaderProps> = ({
   title,
   backendOnline,
   vaultSize,
+  dbMode,
+  isCloud = false,
   onRefresh,
   refreshing = false,
 }) => {
@@ -45,6 +49,23 @@ export const Header: React.FC<HeaderProps> = ({
           <Zap size={11} className={backendOnline ? "text-teal-600 fill-teal-600" : ""} />
           <span>{backendOnline ? "Forensic Node Ready" : "Awaiting Backend"}</span>
         </div>
+
+        {backendOnline && (
+          <div
+            style={{
+              background: isCloud ? "rgba(99, 102, 241, 0.08)" : "rgba(100, 116, 139, 0.08)",
+              border: `1px solid ${
+                isCloud ? "rgba(99, 102, 241, 0.25)" : "rgba(100, 116, 139, 0.25)"
+              }`,
+              color: isCloud ? "#6366f1" : "#475569",
+            }}
+            className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold"
+            title={isCloud ? "PostgreSQL & Supabase Storage Active" : "Local SQLite & Filesystem Active"}
+          >
+            <ShieldCheck size={11} className={isCloud ? "text-indigo-600" : "text-slate-600"} />
+            <span>{isCloud ? "Supabase Cloud" : "Local Mode"}</span>
+          </div>
+        )}
       </div>
 
       {/* Right Controls */}

@@ -145,6 +145,8 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
           title={currentTitle}
           backendOnline={backendOnline}
           vaultSize={vaultStatus?.vault_size ?? 0}
+          dbMode={vaultStatus?.db_mode}
+          isCloud={vaultStatus?.is_cloud}
           onRefresh={loadBackendState}
           refreshing={refreshing}
         />

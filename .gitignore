@@ -58,7 +58,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
-sample-5s.mp4
-.gitignore
-backend/sample_match_highlight.mp4
-backend/acceptance_ref_broadcast.mp4
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
