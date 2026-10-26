@@ -10,3 +10,4 @@ torch>=2.0.0
 torchvision>=0.15.0
 faiss-cpu>=1.7.0
 Pillow>=10.0.0
+ImageHash>=4.3.0

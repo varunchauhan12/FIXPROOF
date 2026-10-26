@@ -1,4 +1,6 @@
 import os
+import re
+from datetime import datetime, timezone
 
 # Prevent OpenMP duplicate runtime abort on macOS between PyTorch and FAISS
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -8,6 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -17,15 +20,23 @@ app = FastAPI(title="FixProof API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
 
 import shutil
 from app.extractor import extract_video_frames
+from app.vault import default_vault
+from app.registry import (
+    register_asset,
+    list_registered_assets,
+    get_asset_detail,
+    delete_asset_record,
+    load_incidents,
+    save_incident,
+)
 
 # Storage directory for official reference videos and extracted frames
 STORAGE_DIR = Path(__file__).resolve().parent.parent / "storage" / "videos"
@@ -33,11 +44,21 @@ STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 FRAMES_DIR = Path(__file__).resolve().parent.parent / "storage" / "frames"
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
+# Isolated storage directory for untrusted suspect videos and frames
+SUSPECTS_DIR = Path(__file__).resolve().parent.parent / "storage" / "suspects"
+SUSPECTS_VIDEOS_DIR = SUSPECTS_DIR / "videos"
+SUSPECTS_FRAMES_DIR = SUSPECTS_DIR / "frames"
+SUSPECTS_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+SUSPECTS_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
 # Allowed video extensions and 50 MB size limit for reference uploads
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 CHUNK_SIZE_BYTES = 1024 * 1024          # 1 MB chunk for streaming
 
+
+SAFE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-]+$")
+SAFE_FRAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]+\.(jpg|jpeg|png)$", re.IGNORECASE)
 
 
 class DiagnoseRequest(BaseModel):
@@ -48,12 +69,110 @@ class DiagnoseRequest(BaseModel):
 def health_check():
     return {"status": "ok", "service": "FixProof API"}
 
-from app.vault import default_vault
 
 @app.get("/api/vault/status")
 def get_vault_status():
     """Returns the current size, embedding dimensions, and indexed assets of the FAISS reference vault."""
-    return default_vault.get_status()
+    status = default_vault.get_status()
+    all_assets = list_registered_assets(default_vault)
+    status["total_registered_assets"] = len(all_assets)
+    status["total_protected_assets"] = sum(1 for a in all_assets if a.get("indexed"))
+    return status
+
+
+@app.get("/api/vault/assets")
+def list_assets():
+    """Lists all registered official reference assets and their real status."""
+    return list_registered_assets(default_vault)
+
+
+@app.get("/api/vault/assets/{asset_id}")
+def get_single_asset(asset_id: str):
+    """Returns full details and frames for a single registered asset."""
+    if not SAFE_ID_REGEX.match(asset_id):
+        raise HTTPException(status_code=400, detail="Invalid asset ID format.")
+    asset = get_asset_detail(asset_id, default_vault)
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"Asset '{asset_id}' not found.")
+    return asset
+
+
+@app.get("/api/vault/assets/{asset_id}/frames/{frame_filename}")
+def stream_asset_frame(asset_id: str, frame_filename: str):
+    """
+    Safely streams an extracted video frame to the client.
+    Strictly checks path containment and character safety.
+    """
+    if not SAFE_ID_REGEX.match(asset_id):
+        raise HTTPException(status_code=400, detail="Invalid asset ID format.")
+    if not SAFE_FRAME_REGEX.match(frame_filename):
+        raise HTTPException(status_code=400, detail="Invalid frame filename.")
+
+    frame_path = (FRAMES_DIR / asset_id / frame_filename).resolve()
+    base_dir = FRAMES_DIR.resolve()
+
+    if frame_path.is_relative_to(base_dir) and frame_path.is_file():
+        return FileResponse(
+            str(frame_path),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    suspect_frame_path = (SUSPECTS_FRAMES_DIR / asset_id / frame_filename).resolve()
+    suspect_base = SUSPECTS_FRAMES_DIR.resolve()
+
+    if suspect_frame_path.is_relative_to(suspect_base) and suspect_frame_path.is_file():
+        return FileResponse(
+            str(suspect_frame_path),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    raise HTTPException(status_code=404, detail="Frame not found.")
+
+
+@app.get("/api/vault/assets/{asset_id}/video")
+def stream_asset_video(asset_id: str):
+    """
+    Safely streams the original uploaded video for an asset.
+    """
+    if not SAFE_ID_REGEX.match(asset_id):
+        raise HTTPException(status_code=400, detail="Invalid asset ID format.")
+
+    matches = list(STORAGE_DIR.glob(f"{asset_id}.*"))
+    base_dir = STORAGE_DIR.resolve()
+
+    if not matches:
+        matches = list(SUSPECTS_VIDEOS_DIR.glob(f"{asset_id}.*"))
+        base_dir = SUSPECTS_VIDEOS_DIR.resolve()
+
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Video for asset '{asset_id}' not found.")
+
+    target_video = matches[0].resolve()
+
+    if not target_video.is_relative_to(base_dir):
+        raise HTTPException(status_code=403, detail="Access denied.")
+    if not target_video.is_file():
+        raise HTTPException(status_code=404, detail="Video file not found.")
+
+    ext = target_video.suffix.lower()
+    media_type = "video/mp4" if ext == ".mp4" else f"video/{ext.lstrip('.')}"
+    return FileResponse(str(target_video), media_type=media_type)
+
+
+
+@app.delete("/api/vault/assets/{asset_id}")
+def delete_asset(asset_id: str):
+    """Safely removes an asset, its video, extracted frames, and vault vectors."""
+    if not SAFE_ID_REGEX.match(asset_id):
+        raise HTTPException(status_code=400, detail="Invalid asset ID format.")
+    asset = get_asset_detail(asset_id, default_vault)
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"Asset '{asset_id}' not found.")
+    delete_asset_record(asset_id, default_vault)
+    return {"status": "deleted", "asset_id": asset_id}
+
 
 
 @app.post("/api/vault/index/{asset_id}")
@@ -84,6 +203,42 @@ def index_existing_asset(asset_id: str):
         raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to index asset: {e}")
+
+
+from app.matcher import analyze_asset_matches
+
+@app.post("/api/matches/{asset_id}")
+def match_uploaded_asset(asset_id: str, k: int = 3):
+    """
+    Analyzes an already-uploaded video (asset_id) against the FAISS reference vault.
+    Performs visual embedding similarity search and pHash cross-check.
+    Never indexes the asset during detection and prevents self-matching.
+    """
+    asset_frames_dir = FRAMES_DIR / asset_id
+    if not asset_frames_dir.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Asset '{asset_id}' not found. No extracted frames available for matching.",
+        )
+    try:
+        results = analyze_asset_matches(
+            submitted_asset_id=asset_id,
+            frames_dir=asset_frames_dir,
+            vault=default_vault,
+            k_candidates=k,
+        )
+        incident_id = str(uuid.uuid4())
+        results["incident_id"] = incident_id
+        results["scanned_at"] = datetime.now(timezone.utc).isoformat()
+        detail = get_asset_detail(asset_id, default_vault)
+        results["suspect_filename"] = detail["filename"] if detail else f"asset_{asset_id[:8]}"
+        save_incident(results)
+        return results
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Matching analysis failed: {e}")
+
 
 
 @app.post("/api/vault/ingest")
@@ -134,8 +289,32 @@ async def ingest_reference_video(
             sample_interval_sec=5,
         )
 
+        # 5. Optionally index into the FAISS vault immediately
+        indexed = False
+        indexed_records = []
+        if auto_index:
+            indexed_records = default_vault.index_asset_frames(
+                asset_id=asset_id,
+                frames=extracted_frames,
+                frames_dir=asset_frames_dir,
+            )
+            indexed = True
+
+        # 6. Register into persistent reference asset registry
+        register_asset(
+            asset_id=asset_id,
+            filename=file.filename,
+            stored_filename=stored_filename,
+            file_size=total_bytes,
+            content_type=file.content_type or "video/mp4",
+            duration_seconds=duration_sec,
+            frame_count=len(extracted_frames),
+            frames=extracted_frames,
+            auto_indexed=indexed,
+        )
+
         response_data = {
-            "status": "uploaded",
+            "status": "indexed" if indexed else "uploaded",
             "asset_id": asset_id,
             "filename": file.filename,
             "file_size": total_bytes,
@@ -144,21 +323,16 @@ async def ingest_reference_video(
             "frame_count": len(extracted_frames),
             "sample_interval_seconds": 5,
             "frames": extracted_frames,
+            "indexed": indexed,
+            "indexed_vectors": len(indexed_records),
         }
 
-        # 5. Optionally index into the FAISS vault immediately
-        if auto_index:
-            indexed_records = default_vault.index_asset_frames(
-                asset_id=asset_id,
-                frames=extracted_frames,
-                frames_dir=asset_frames_dir,
-            )
-            response_data["status"] = "indexed"
-            response_data["indexed"] = True
+        if indexed:
             response_data["vault_size"] = default_vault.vector_db.ntotal
             response_data["indexed_records"] = indexed_records
 
         return response_data
+
     except HTTPException:
         # Clean up any partially written video and frame directory on HTTP exceptions
         if target_path.exists():
@@ -187,7 +361,105 @@ async def ingest_reference_video(
         )
     finally:
         await file.close()
-      
+
+
+@app.post("/api/threats/scan")
+async def scan_suspect_video(
+    file: UploadFile = File(...),
+):
+    """
+    Ingests an untrusted suspect video, extracts frames, and executes Sentinel-style
+    visual matching against the FAISS reference vault.
+    NEVER indexes suspect video into the reference vault.
+    Records the scan incident for forensic review.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No suspect video provided.")
+    file_ext = Path(file.filename).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported video format '{file_ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    suspect_id = str(uuid.uuid4())
+    stored_filename = f"{suspect_id}{file_ext}"
+    target_path = SUSPECTS_VIDEOS_DIR / stored_filename
+    suspect_frames_dir = SUSPECTS_FRAMES_DIR / suspect_id
+    total_bytes = 0
+
+
+    try:
+        with open(target_path, "wb") as buffer:
+            while chunk := await file.read(CHUNK_SIZE_BYTES):
+                total_bytes += len(chunk)
+                if total_bytes > MAX_FILE_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds maximum allowed size of {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB.",
+                    )
+                buffer.write(chunk)
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        duration_sec, extracted_frames = extract_video_frames(
+            video_path=target_path,
+            output_dir=suspect_frames_dir,
+            sample_interval_sec=5,
+        )
+
+        match_results = analyze_asset_matches(
+            submitted_asset_id=suspect_id,
+            frames_dir=suspect_frames_dir,
+            vault=default_vault,
+            k_candidates=3,
+        )
+
+        match_results["suspect_filename"] = file.filename
+        match_results["file_size"] = total_bytes
+        match_results["duration_seconds"] = duration_sec
+        match_results["frame_count"] = len(extracted_frames)
+        match_results["scanned_at"] = datetime.now(timezone.utc).isoformat()
+        match_results["incident_id"] = str(uuid.uuid4())
+
+        save_incident(match_results)
+        return match_results
+    except HTTPException:
+        if target_path.exists():
+            target_path.unlink(missing_ok=True)
+        if suspect_frames_dir.exists():
+            shutil.rmtree(suspect_frames_dir, ignore_errors=True)
+        raise
+    except ValueError as ve:
+        if target_path.exists():
+            target_path.unlink(missing_ok=True)
+        if suspect_frames_dir.exists():
+            shutil.rmtree(suspect_frames_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail=f"Invalid suspect video: {ve}")
+    except Exception as err:
+        if target_path.exists():
+            target_path.unlink(missing_ok=True)
+        if suspect_frames_dir.exists():
+            shutil.rmtree(suspect_frames_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Failed to scan suspect video: {err}")
+    finally:
+        await file.close()
+
+
+@app.get("/api/incidents")
+def get_incidents_list():
+    """Returns recorded threat scan incidents."""
+    return load_incidents()
+
+
+@app.get("/api/incidents/{incident_id}")
+def get_single_incident(incident_id: str):
+    """Returns details for a specific incident."""
+    for inc in load_incidents():
+        if inc.get("incident_id") == incident_id:
+            return inc
+    raise HTTPException(status_code=404, detail="Incident not found.")
+
 
 
 @app.post("/diagnose")

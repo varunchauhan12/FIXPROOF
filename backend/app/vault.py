@@ -286,6 +286,47 @@ class ReferenceVault:
 
         return dists, matches
 
+    def remove_asset_vectors(self, asset_id: str) -> int:
+        """
+        Removes all vectors belonging to asset_id from FAISS and metadata_store.
+        Rebuilds the FAISS index with remaining vectors and preserves synchronization.
+        Returns the number of removed vectors.
+        """
+        target_vids = {
+            vid for vid, meta in self.metadata_store.items()
+            if meta.get("asset_id") == asset_id
+        }
+        if not target_vids:
+            return 0
 
-# Global default vault instance for FixProof
+        removed_count = len(target_vids)
+        remaining_items = [
+            (int(vid), meta)
+            for vid, meta in self.metadata_store.items()
+            if vid not in target_vids
+        ]
+        remaining_items.sort(key=lambda x: x[0])
+
+        if not remaining_items:
+            self.clear()
+            return removed_count
+
+        new_index = faiss.IndexFlatL2(EMBEDDING_DIM)
+        new_meta: Dict[str, Dict[str, Any]] = {}
+
+        for new_vid, (old_vid, meta) in enumerate(remaining_items):
+            vec = self.vector_db.reconstruct(old_vid).reshape(1, -1)
+            new_index.add(vec)
+            updated_meta = dict(meta)
+            updated_meta["vector_id"] = new_vid
+            new_meta[str(new_vid)] = updated_meta
+
+        self.vector_db = new_index
+        self.metadata_store = new_meta
+        self.save_vault()
+        logger.info(f"[Vault] Removed {removed_count} vectors for asset '{asset_id}'. Vault size now {self.vector_db.ntotal}.")
+        return removed_count
+
+
+
 default_vault = ReferenceVault()

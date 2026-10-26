@@ -1,91 +1,187 @@
 "use client";
 
-import { useState } from "react";
+import React, { useState, useEffect, useCallback } from "react";
+import { Sidebar, NavTab } from "@/components/layout/Sidebar";
+import { Header } from "@/components/layout/Header";
+import { AssetVault } from "@/components/dashboard/AssetVault";
+import { ThreatHunter } from "@/components/dashboard/ThreatHunter";
+import { IncidentResponse } from "@/components/dashboard/IncidentResponse";
+import { Overview } from "@/components/dashboard/Overview";
+import { Intelligence } from "@/components/dashboard/Intelligence";
+import {
+  EnforcementView,
+  SwarmLogsView,
+  SettingsView,
+  SupportView,
+} from "@/components/dashboard/SecondaryViews";
+import { AssetRecord, VaultStatus, MatchAnalysisResult } from "@/lib/types";
+import {
+  checkBackendHealth,
+  getVaultStatus,
+  getRegisteredAssets,
+  getIncidentsList,
+} from "@/lib/api";
 
-type DiagnosisResponse = {
-  diagnosis: string;
-  model: string;
-  provider: string;
+const PAGE_TITLES: Record<NavTab, string> = {
+  overview: "Command Overview",
+  vault: "Digital Asset Vault",
+  hunter: "Sentinel Threat Hunter",
+  incidents: "Incident Response",
+  intelligence: "Intelligence & Analytics",
+  enforcer: "Enforcement & Licensing",
+  notifications: "Forensics Swarm Logs",
+  analytics: "Intelligence & Analytics",
+  settings: "System Settings",
+  support: "Support & Documentation",
 };
 
-export default function Home() {
-  const [issue, setIssue] = useState("");
-  const [result, setResult] = useState<DiagnosisResponse | null>();
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+export default function DashboardPage() {
+  const [activeTab, setActiveTab] = useState<NavTab>("vault");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
 
-  const handleDiagnose = async () => {
-    if (!issue.trim()) {
-      setError("Please describe a bug first.");
-      return;
-    }
+  // Backend state
+  const [backendOnline, setBackendOnline] = useState<boolean>(false);
+  const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
+  const [assets, setAssets] = useState<AssetRecord[]>([]);
+  const [incidents, setIncidents] = useState<MatchAnalysisResult[]>([]);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
 
-    setLoading(true);
-    setError("");
-    setResult(null);
+  // Cross-page navigation context (e.g. from Hunter to Incidents)
+  const [selectedIncidentForInspection, setSelectedIncidentForInspection] =
+    useState<MatchAnalysisResult | null>(null);
+
+  const loadBackendState = useCallback(async () => {
+    setRefreshing(true);
     try {
-      const response = await fetch("http://localhost:8000/diagnose", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          issue_description: issue,
-        }),
-      });
+      const isHealthy = await checkBackendHealth();
+      setBackendOnline(isHealthy);
 
-      if (!response.ok) {
-        throw new Error("Failed to get diagnosis");
+      if (isHealthy) {
+        const [statusData, assetsData, incidentsData] = await Promise.all([
+          getVaultStatus().catch(() => null),
+          getRegisteredAssets().catch(() => []),
+          getIncidentsList().catch(() => []),
+        ]);
+        setVaultStatus(statusData);
+        setAssets(assetsData);
+        setIncidents(incidentsData);
+      } else {
+        setVaultStatus(null);
       }
-      const data: DiagnosisResponse = await response.json();
-      setResult(data);
-    } catch (error) {
-      setError("Could not reach FixProof. Check that the backend is running.");
+    } catch {
+      setBackendOnline(false);
     } finally {
-      setLoading(false);
+      setRefreshing(false);
     }
+  }, []);
+
+  useEffect(() => {
+    loadBackendState();
+
+    // Auto-refresh every 12 seconds
+    const interval = setInterval(loadBackendState, 12000);
+    return () => clearInterval(interval);
+  }, [loadBackendState]);
+
+  const handleNavigateToIncidents = (incident: MatchAnalysisResult) => {
+    setSelectedIncidentForInspection(incident);
+    setActiveTab("incidents");
   };
 
+  const currentTitle = PAGE_TITLES[activeTab] || "Command Center";
+  const isDarkTab = ["hunter", "incidents", "intelligence", "enforcer", "notifications"].includes(
+    activeTab
+  );
+
   return (
-    <main className="mx-auto min-h-screen max-w-3xl p-8">
-      <h1 className="text-4xl font-bold">FixProof</h1>
-      <p className="mt-3 text-gray-600">
-        Investigate bugs with AI-powered debugging.
-      </p>
-      <label htmlFor="issue" className="mt-8 block font-semibold">
-        Describe your bug
-      </label>
-      <textarea
-        id="issue"
-        value={issue}
-        onChange={(event) => setIssue(event.target.value)}
-        placeholder="Describe what went wrong..."
-        className="mt-3 min-h-36 w-full rounded-lg border p-4"
-      />{" "}
-      <button
-        onClick={handleDiagnose}
-        disabled={loading}
-        className="mt-4 rounded-lg bg-black px-5 py-3 text-white disabled:opacity-50"
-      >
-        {loading ? "Investigating..." : "Diagnose bug"}
-      </button>
-      {error && <p className="mt-4 text-red-600">{error}</p>}
-      {result && (
-        <section className="mt-8 rounded-xl border p-5">
-          <h2 className="text-xl font-semibold">Preliminary diagnosis</h2>
+    <div
+      style={{
+        background: isDarkTab ? "#06090f" : "#f6f7fc",
+        transition: "background 0.25s ease",
+      }}
+      className="flex min-h-screen"
+    >
+      {/* ─── Sidebar ─── */}
+      <Sidebar
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed((c) => !c)}
+        backendOnline={backendOnline}
+        vaultSize={vaultStatus?.vault_size ?? 0}
+      />
 
-          <p className="mt-4 whitespace-pre-wrap">{result.diagnosis}</p>
+      {/* ─── Main Content Area ─── */}
+      <div className="flex-1 flex flex-col min-w-0">
+        <Header
+          title={currentTitle}
+          backendOnline={backendOnline}
+          vaultSize={vaultStatus?.vault_size ?? 0}
+          onRefresh={loadBackendState}
+          refreshing={refreshing}
+        />
 
-          <p className="mt-5 text-sm text-gray-500">Model: {result.model}</p>
+        <main className="flex-1 p-6 overflow-y-auto">
+          {activeTab === "overview" && (
+            <Overview
+              assets={assets}
+              vaultStatus={vaultStatus}
+              incidents={incidents}
+              onNavigateToTab={setActiveTab}
+            />
+          )}
 
-          <p className="text-sm text-gray-500">Provider: {result.provider}</p>
+          {activeTab === "vault" && (
+            <AssetVault
+              assets={assets}
+              vaultStatus={vaultStatus}
+              onRefresh={loadBackendState}
+              refreshing={refreshing}
+            />
+          )}
 
-          <p className="mt-3 text-sm text-amber-700">
-            This is an initial hypothesis. Source code inspection and test
-            verification are not implemented yet.
-          </p>
-        </section>
-      )}
-    </main>
+          {activeTab === "hunter" && (
+            <ThreatHunter
+              assets={assets}
+              vaultStatus={vaultStatus}
+              onNavigateToVault={() => setActiveTab("vault")}
+              onViewIncident={handleNavigateToIncidents}
+            />
+          )}
+
+          {activeTab === "incidents" && (
+            <IncidentResponse
+              initialIncident={selectedIncidentForInspection}
+              assets={assets}
+              onNavigateToVault={(assetId) => {
+                setActiveTab("vault");
+              }}
+              onNavigateToHunter={() => setActiveTab("hunter")}
+            />
+          )}
+
+          {activeTab === "intelligence" && (
+            <Intelligence
+              assets={assets}
+              vaultStatus={vaultStatus}
+              incidents={incidents}
+              onNavigateToTab={setActiveTab}
+            />
+          )}
+
+          {activeTab === "enforcer" && (
+            <EnforcementView incidents={incidents} assets={assets} />
+          )}
+
+          {activeTab === "notifications" && (
+            <SwarmLogsView incidents={incidents} assets={assets} />
+          )}
+
+          {activeTab === "settings" && <SettingsView />}
+
+          {activeTab === "support" && <SupportView />}
+        </main>
+      </div>
+    </div>
   );
 }

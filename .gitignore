@@ -27,6 +27,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+storage/
+backend/storage/
+
 
 # Python Virtual Environments
 .venv/
