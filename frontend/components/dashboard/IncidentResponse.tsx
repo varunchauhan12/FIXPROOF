@@ -148,6 +148,8 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                     ? "#ef4444"
                     : inc.overall_status === "SUSPECT"
                     ? "#f59e0b"
+                    : inc.overall_status === "NO_REFERENCE_DATA"
+                    ? "#64748b"
                     : "#0d9488";
 
                 return (
@@ -218,15 +220,23 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
                           background:
                             selectedIncident.overall_status === "CANDIDATE_MATCH"
                               ? "rgba(239, 68, 68, 0.2)"
+                              : selectedIncident.overall_status === "SUSPECT"
+                              ? "rgba(245, 158, 11, 0.2)"
+                              : selectedIncident.overall_status === "NO_REFERENCE_DATA"
+                              ? "rgba(100, 116, 139, 0.2)"
                               : "rgba(13, 148, 136, 0.2)",
                           color:
                             selectedIncident.overall_status === "CANDIDATE_MATCH"
                               ? "#f87171"
+                              : selectedIncident.overall_status === "SUSPECT"
+                              ? "#fbbf24"
+                              : selectedIncident.overall_status === "NO_REFERENCE_DATA"
+                              ? "#cbd5e1"
                               : "#2dd4bf",
                         }}
                         className="px-3 py-1 rounded-full text-[11px] font-extrabold uppercase tracking-wide border border-current/20"
                       >
-                        {selectedIncident.overall_status}
+                        {selectedIncident.overall_status.replace(/_/g, " ")}
                       </span>
                     </div>
                   </div>

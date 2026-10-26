@@ -56,3 +56,48 @@ body {
 .animate-spin-smooth {
   animation: spinSmooth 0.9s linear infinite;
 }
+
+/* Ripple cell — GSSoC teal */
+@keyframes cellRipple {
+  0%   { background-color: transparent; }
+  28%  { background-color: rgba(20,184,166,0.20); box-shadow: inset 0 0 16px rgba(20,184,166,0.14); }
+  100% { background-color: transparent; }
+}
+.animate-cell-ripple {
+  animation: cellRipple var(--duration, 360ms) var(--delay, 0ms) ease-out both;
+}
+
+/* Cell Pulse */
+@keyframes cellPulse {
+  0%   { background-color: transparent; }
+  30%  { background-color: rgba(13,148,136,0.15); }
+  100% { background-color: transparent; }
+}
+
+/* Animated gradient text */
+@keyframes gradientShift {
+  0%, 100% { background-position: 0% 50%; }
+  50%       { background-position: 100% 50%; }
+}
+.animate-gradient {
+  background-size: 200% 200%;
+  animation: gradientShift 3s ease infinite;
+}
+
+/* Floating animation */
+@keyframes floatAnimation {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-12px); }
+}
+.animate-float {
+  animation: floatAnimation 6s ease-in-out infinite;
+}
+
+/* Globe canvas */
+canvas {
+  image-rendering: pixelated;
+}
+
+html {
+  scroll-behavior: smooth;
+}
