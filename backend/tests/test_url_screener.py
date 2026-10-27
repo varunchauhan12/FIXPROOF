@@ -252,6 +252,10 @@ class TestURLScreeningFlow(unittest.TestCase):
         self.client = TestClient(app)
         self.test_img = create_test_image(color="blue")
         self.test_img_bytes = image_to_bytes(self.test_img)
+        if default_vault.vector_db.ntotal == 0:
+            import numpy as np
+            dummy_vec = np.zeros((1, 576), dtype="float32")
+            default_vault.vector_db.add(dummy_vec)
 
     @patch("app.url_screener.extract_public_video_metadata")
     @patch("app.url_screener.fetch_suspect_thumbnail_image")

@@ -45,9 +45,14 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.client = TestClient(app)
-        cls.has_live_cloud = bool(
-            os.getenv("SUPABASE_DB_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        db_url = os.getenv("SUPABASE_DB_URL") or ""
+        role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
+        is_placeholder = (
+            "[YOUR-" in db_url
+            or "your_secret" in role_key
+            or "your_public" in (os.getenv("SUPABASE_ANON_KEY") or "")
         )
+        cls.has_live_cloud = bool(db_url and role_key and not is_placeholder)
         cls.test_asset_id = "46aef41b-b790-442e-a302-e8fc2fd05af1"
 
     def setUp(self):
@@ -229,6 +234,9 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
 
     def test_stream_nonexistent_asset_returns_404(self):
         """Verifies streaming nonexistent asset returns HTTP 404 in cloud mode."""
+        if not self.has_live_cloud:
+            self.skipTest("Live Supabase credentials not configured.")
+
         os.environ["FIXPROOF_DB_MODE"] = "supabase"
         nonexistent = "00000000-0000-0000-0000-000000000000"
         resp_video = self.client.get(f"/api/vault/assets/{nonexistent}/video", follow_redirects=False)
