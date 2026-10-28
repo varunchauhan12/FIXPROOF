@@ -27,7 +27,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY app/ ./app/
 COPY migrations/ ./migrations/
 COPY scripts/ ./scripts/
-COPY acceptance_ref_broadcast.mp4 sample_match_highlight.mp4 ./
 
 # Create storage directories
 RUN mkdir -p storage/videos storage/frames storage/suspects storage/vault storage/detailed_reports storage/cloud_cache

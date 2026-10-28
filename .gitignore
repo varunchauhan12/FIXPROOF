@@ -64,3 +64,5 @@ Thumbs.db
 *.avi
 *.mkv
 *.webm
+!backend/acceptance_ref_broadcast.mp4
+!backend/sample_match_highlight.mp4
