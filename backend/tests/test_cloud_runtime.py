@@ -56,7 +56,9 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
         cls.test_asset_id = "2c6fa947-96cb-40c8-971e-a82869ac2214"
         if cls.has_live_cloud:
             try:
-                row = default_db_manager.fetch_one("SELECT asset_id FROM reference_assets LIMIT 1;")
+                from app.db import DatabaseConfig, DBMode, DatabaseManager
+                mgr = DatabaseManager(DatabaseConfig(mode=DBMode.SUPABASE, connection_url=db_url))
+                row = mgr.fetch_one("SELECT asset_id FROM reference_assets ORDER BY created_at DESC LIMIT 1;")
                 if row:
                     cls.test_asset_id = str(row["asset_id"])
             except Exception:
@@ -393,6 +395,117 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
         incidents = load_incidents()
         self.assertIsInstance(incidents, list)
         self.assertGreaterEqual(len(incidents), 0)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 6. Production Regression Tests: Sync, Stale Vector Filter, Deletion & URL Fallback
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def test_vault_sync_prunes_orphaned_vectors(self):
+        """Issue 1 Regression: Vault sync removes vectors belonging to deleted assets."""
+        import tempfile
+        import numpy as np
+        import faiss
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            v = ReferenceVault(vault_dir=Path(tmp_dir), mode="local")
+            v.vector_db = faiss.IndexFlatL2(EMBEDDING_DIM)
+            v.metadata_store = {}
+
+            # Add vectors for valid asset and orphaned asset
+            v1 = np.ones((1, EMBEDDING_DIM), dtype=np.float32)
+            faiss.normalize_L2(v1)
+            v.vector_db.add(v1)
+            v.metadata_store["0"] = {"asset_id": "valid-asset-1", "vector_id": 0}
+
+            v2 = np.zeros((1, EMBEDDING_DIM), dtype=np.float32)
+            v2[0, 0] = 1.0
+            v.vector_db.add(v2)
+            v.metadata_store["1"] = {"asset_id": "stale-asset-to-prune", "vector_id": 1}
+
+            self.assertEqual(v.vector_db.ntotal, 2)
+            pruned = v.sync_with_registered_assets(valid_asset_ids={"valid-asset-1"})
+            self.assertEqual(pruned, 1)
+            self.assertEqual(v.vector_db.ntotal, 1)
+            self.assertEqual(len(v.metadata_store), 1)
+            self.assertEqual(v.metadata_store["0"]["asset_id"], "valid-asset-1")
+
+    def test_matcher_filters_stale_vectors_not_in_registry(self):
+        """Issue 2 Regression: Matcher ignores vectors from deleted/stale assets."""
+        import tempfile
+        import numpy as np
+        import faiss
+        from PIL import Image
+        from app.matcher import match_single_frame
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            v = ReferenceVault(vault_dir=Path(tmp_dir), mode="local")
+            v.vector_db = faiss.IndexFlatL2(EMBEDDING_DIM)
+            v.metadata_store = {}
+
+            # Add an identical vector for a deleted/stale asset
+            test_img = Image.new("RGB", (224, 224), color=(128, 64, 32))
+            from app.vault import extract_image_embedding
+            emb = extract_image_embedding(test_img)
+            v.vector_db.add(emb)
+            v.metadata_store["0"] = {
+                "asset_id": "stale-deleted-asset",
+                "frame_id": 0,
+                "timestamp_sec": 0,
+                "filename": "frame_0000s.jpg",
+                "frame_path": "",
+            }
+
+            # If valid_asset_ids only has registered assets, stale asset should be filtered out
+            res = match_single_frame(
+                suspect_img=test_img,
+                submitted_asset_id="suspect-job-id",
+                vault=v,
+                k=3,
+                valid_asset_ids={"legitimate-active-asset"},
+            )
+            self.assertIsNone(res, "Matcher should return None when only stale vectors match")
+
+    def test_storage_client_delete_objects_batch(self):
+        """Issue 3 Regression: SupabaseStorageClient.delete_objects handles multiple paths."""
+        storage = SupabaseStorageClient()
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_url.return_value.__enter__.return_value = mock_resp
+            result = storage.delete_objects("reference-frames", ["asset1/f1.jpg", "asset1/f2.jpg"])
+            self.assertTrue(result)
+            self.assertTrue(mock_url.called)
+
+    def test_youtube_metadata_fallback_on_bot_detection(self):
+        """Issue 4 Regression: URL screener falls back to oEmbed on YouTube bot-check error."""
+        from app.url_screener import extract_public_video_metadata
+
+        mock_oembed_return = {
+            "title": "Fallback Video Title",
+            "platform": "YouTube",
+            "uploader": "Fallback Channel",
+            "uploader_id": "Fallback Channel",
+            "channel_url": "https://www.youtube.com/@channel",
+            "duration_seconds": 0.0,
+            "view_count": None,
+            "upload_date": "",
+            "description": "Mocked fallback description",
+            "webpage_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "thumbnail_url": "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg",
+            "candidate_thumbnail_urls": ["https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg"],
+            "candidate_count": 1,
+            "storyboards": [],
+            "extraction_method": "youtube_oembed_cloud_fallback",
+        }
+
+        with patch("app.url_screener.yt_dlp.YoutubeDL") as mock_ydl_cls:
+            mock_ydl = MagicMock()
+            mock_ydl.extract_info.side_effect = Exception("Sign in to confirm you're not a bot")
+            mock_ydl_cls.return_value.__enter__.return_value = mock_ydl
+            with patch("app.url_screener.extract_youtube_metadata_via_oembed", return_value=mock_oembed_return):
+                meta = extract_public_video_metadata("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+                self.assertEqual(meta["title"], "Fallback Video Title")
+                self.assertEqual(meta["platform"], "YouTube")
+                self.assertEqual(meta["extraction_method"], "youtube_oembed_cloud_fallback")
 
 
 if __name__ == "__main__":
