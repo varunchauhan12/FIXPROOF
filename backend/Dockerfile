@@ -21,7 +21,7 @@ COPY requirements.txt .
 # Pre-install PyTorch CPU wheel to significantly reduce download size and build time
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
 
 # Copy application source code and migrations
 COPY app/ ./app/
