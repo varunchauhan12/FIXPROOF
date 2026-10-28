@@ -80,6 +80,7 @@ class ReferenceVault:
     """
 
     def __init__(self, vault_dir: Optional[Path] = None, mode: Optional[str] = None):
+        passed_vault_dir = vault_dir is not None
         if vault_dir is None:
             vault_dir = Path(__file__).resolve().parent.parent / "storage" / "vault"
         self.vault_dir = Path(vault_dir)
@@ -90,7 +91,7 @@ class ReferenceVault:
 
         if mode is not None:
             self.mode = mode.lower()
-        elif vault_dir is not None:
+        elif passed_vault_dir:
             self.mode = "local"
         else:
             self.mode = get_db_config().mode.value
@@ -143,10 +144,16 @@ class ReferenceVault:
             """
         )
         if not row:
-            raise RuntimeError(
-                "No active FAISS vault snapshot found in PostgreSQL table 'vault_snapshots'. "
-                "Cannot initialize cloud reference vault. Run migration or staging sync first."
+            logger.info(
+                "[Vault] No active cloud vault snapshot found in PostgreSQL table 'vault_snapshots' "
+                "(fresh database initialization). Starting with clean empty in-memory reference vault (0 vectors, dim=576)."
             )
+            self.vector_db = faiss.IndexFlatL2(EMBEDDING_DIM)
+            self.metadata_store = {}
+            self.snapshot_version = None
+            self.index_path = None
+            self.meta_path = None
+            return
 
         storage_client = SupabaseStorageClient()
         bucket = "vault-snapshots"
@@ -395,8 +402,8 @@ class ReferenceVault:
             "embedding_dim": EMBEDDING_DIM,
             "total_indexed_assets": len(unique_assets),
             "indexed_assets": unique_assets,
-            "index_file": str(self.index_path),
-            "metadata_file": str(self.meta_path),
+            "index_file": str(self.index_path) if self.index_path else None,
+            "metadata_file": str(self.meta_path) if self.meta_path else None,
             "mode": self.mode,
             "snapshot_version": self.snapshot_version,
         }

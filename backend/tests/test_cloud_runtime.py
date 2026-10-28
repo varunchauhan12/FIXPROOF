@@ -56,9 +56,7 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
         cls.test_asset_id = "2c6fa947-96cb-40c8-971e-a82869ac2214"
         if cls.has_live_cloud:
             try:
-                from app.db import DatabaseManager, DatabaseConfig, DBMode
-                mgr = DatabaseManager(DatabaseConfig(mode=DBMode.SUPABASE))
-                row = mgr.fetch_one("SELECT asset_id FROM reference_assets LIMIT 1;")
+                row = default_db_manager.fetch_one("SELECT asset_id FROM reference_assets LIMIT 1;")
                 if row:
                     cls.test_asset_id = str(row["asset_id"])
             except Exception:
@@ -118,13 +116,20 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
                 self.assertIn("Cloud FAISS snapshot integrity failure", str(ctx.exception))
                 self.assertIn("SHA-256 mismatch", str(ctx.exception))
 
-    def test_cloud_vault_fails_on_missing_active_snapshot(self):
-        """Verifies ReferenceVault fails fast when no active snapshot exists in database."""
+    def test_cloud_vault_graceful_empty_start_on_missing_active_snapshot(self):
+        """Verifies ReferenceVault initializes an empty FAISS index when no active snapshot exists."""
         with patch("app.db.DatabaseManager.fetch_one") as mock_fetch:
             mock_fetch.return_value = None
-            with self.assertRaises(RuntimeError) as ctx:
-                ReferenceVault(mode="supabase")
-            self.assertIn("No active FAISS vault snapshot found", str(ctx.exception))
+            vault = ReferenceVault(mode="supabase")
+            self.assertEqual(vault.vector_db.ntotal, 0)
+            self.assertEqual(vault.metadata_store, {})
+            self.assertIsNone(vault.snapshot_version)
+            self.assertIsNone(vault.index_path)
+            self.assertIsNone(vault.meta_path)
+            status = vault.get_status()
+            self.assertEqual(status["status"], "empty")
+            self.assertEqual(status["vault_size"], 0)
+            self.assertEqual(status["embedding_dim"], 576)
 
     def test_cloud_vault_fails_on_storage_download_error(self):
         """Verifies ReferenceVault fails fast when snapshot storage is unreachable."""
@@ -235,17 +240,13 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
             self.skipTest("Live Supabase credentials not configured.")
 
         os.environ["FIXPROOF_DB_MODE"] = "supabase"
-        vault = ReferenceVault(mode="supabase")
-        sample_frame = None
-        for meta in vault.metadata_store.values():
-            if meta.get("asset_id") and meta.get("filename"):
-                sample_frame = meta
-                break
-        if not sample_frame:
+        row = default_db_manager.fetch_one("SELECT asset_id, storage_path FROM reference_frames LIMIT 1;")
+        if not row or not row.get("storage_path"):
             self.skipTest("No indexed frames available in live cloud vault.")
 
+        filename = row["storage_path"].split("/")[-1]
         resp = self.client.get(
-            f"/api/vault/assets/{sample_frame['asset_id']}/frames/{sample_frame['filename']}",
+            f"/api/vault/assets/{row['asset_id']}/frames/{filename}",
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.headers.get("content-type"), "image/jpeg")
@@ -347,6 +348,29 @@ class TestCloudRuntimeIntegration(unittest.TestCase):
                         )
                     # Must fail with HTTP 503 or 422, NEVER return false CLEAN
                     self.assertIn(resp.status_code, (422, 503))
+
+    def test_scan_suspect_on_empty_vault_returns_zero_match(self):
+        """Verifies scanning a suspect video with an empty vault returns a 200 zero-match response."""
+        sample_path = BACKEND_DIR / "sample_match_highlight.mp4"
+        if not sample_path.exists():
+            self.skipTest("sample_match_highlight.mp4 not found.")
+
+        empty_vault = ReferenceVault(mode="local")
+        empty_vault.vector_db = faiss.IndexFlatL2(EMBEDDING_DIM)
+        empty_vault.metadata_store = {}
+
+        with patch("app.main.default_vault", empty_vault):
+            with open(sample_path, "rb") as f:
+                resp = self.client.post(
+                    "/api/threats/scan",
+                    files={"file": ("sample_match_highlight.mp4", f, "video/mp4")},
+                    headers={"X-Client-Session-Id": "test-empty-vault-scan"},
+                )
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data.get("overall_status"), "NO_REFERENCE_DATA")
+            self.assertEqual(data.get("candidate_matches_found"), 0)
+            self.assertEqual(len(data.get("reference_matches", [])), 0)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 5. Local Mode Backward Compatibility
