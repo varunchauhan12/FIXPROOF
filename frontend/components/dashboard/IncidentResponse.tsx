@@ -49,6 +49,7 @@ import {
   formatDuration,
 } from "@/lib/api";
 import { AnimatedDownloadButton } from "@/components/ui/AnimatedDownloadButton";
+import { TableRowSkeleton } from "@/components/ui/Skeleton";
 import AILoadingState, { useAnimatedInvestigationSteps } from "@/components/kokonutui/ai-loading";
 
 const packageVerificationStepsConfig = [
@@ -92,7 +93,7 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
   const [incidentSearchQuery, setIncidentSearchQuery] = useState<string>("");
   const [incidentStatusFilter, setIncidentStatusFilter] = useState<string>("ALL");
   const [selectedFrameMatch, setSelectedFrameMatch] = useState<FrameMatchDetail | null>(null);
-  const [loading, setLoading] = useState<boolean>(false);
+  const [loading, setLoading] = useState<boolean>(true);
 
   useEffect(() => {
     if (initialIncident) {
@@ -186,6 +187,7 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
 
   const fetchIncidents = async () => {
     setLoading(true);
+    const startMs = Date.now();
     try {
       const data = await getIncidentsList();
       setIncidents(data);
@@ -195,6 +197,10 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
     } catch {
       // ignore
     } finally {
+      const elapsed = Date.now() - startMs;
+      if (elapsed < 600) {
+        await new Promise((r) => setTimeout(r, 600 - elapsed));
+      }
       setLoading(false);
     }
   };
@@ -530,7 +536,13 @@ export const IncidentResponse: React.FC<IncidentResponseProps> = ({
           </div>
 
           {/* Full-Width Investigation Rows */}
-          {filteredIncidents.length === 0 ? (
+          {loading ? (
+            <div className="space-y-2.5">
+              <TableRowSkeleton />
+              <TableRowSkeleton />
+              <TableRowSkeleton />
+            </div>
+          ) : filteredIncidents.length === 0 ? (
             <div
               style={{
                 background: "#171615",

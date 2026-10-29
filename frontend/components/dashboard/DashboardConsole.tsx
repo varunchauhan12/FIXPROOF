@@ -91,6 +91,7 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [incidents, setIncidents] = useState<MatchAnalysisResult[]>([]);
   const [refreshing, setRefreshing] = useState<boolean>(false);
+  const [initialLoading, setInitialLoading] = useState<boolean>(true);
 
   // Cross-page navigation context (e.g. from Hunter to Incidents)
   const [selectedIncidentForInspection, setSelectedIncidentForInspection] =
@@ -98,6 +99,7 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
 
   const loadBackendState = useCallback(async () => {
     setRefreshing(true);
+    const startMs = Date.now();
     try {
       const isHealthy = await checkBackendHealth();
       setBackendOnline(isHealthy);
@@ -112,12 +114,31 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
         setAssets(assetsData);
         setIncidents(incidentsData);
       } else {
-        setVaultStatus(null);
+        // Fallback probe directly to vault status
+        const statusData = await getVaultStatus().catch(() => null);
+        if (statusData) {
+          setBackendOnline(true);
+          setVaultStatus(statusData);
+          const [assetsData, incidentsData] = await Promise.all([
+            getRegisteredAssets().catch(() => []),
+            getIncidentsList().catch(() => []),
+          ]);
+          setAssets(assetsData);
+          setIncidents(incidentsData);
+        } else {
+          setVaultStatus(null);
+        }
       }
     } catch {
       setBackendOnline(false);
     } finally {
+      // Ensure skeleton is visible during data extraction (minimum 700ms)
+      const elapsed = Date.now() - startMs;
+      if (elapsed < 700) {
+        await new Promise((r) => setTimeout(r, 700 - elapsed));
+      }
       setRefreshing(false);
+      setInitialLoading(false);
     }
   }, []);
 
@@ -243,6 +264,7 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
               onViewIncident={handleNavigateToIncidents}
               onRefresh={loadBackendState}
               refreshing={refreshing}
+              loading={initialLoading || refreshing || vaultStatus === null}
             />
           )}
 
@@ -252,6 +274,7 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
               vaultStatus={vaultStatus}
               onRefresh={loadBackendState}
               refreshing={refreshing}
+              loading={initialLoading || refreshing || vaultStatus === null}
             />
           )}
 
