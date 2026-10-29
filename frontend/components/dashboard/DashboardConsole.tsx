@@ -144,10 +144,6 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
 
   useEffect(() => {
     loadBackendState();
-
-    // Auto-refresh every 12 seconds
-    const interval = setInterval(loadBackendState, 12000);
-    return () => clearInterval(interval);
   }, [loadBackendState]);
 
   const [nemotronPreselectedIncident, setNemotronPreselectedIncident] =
@@ -264,7 +260,7 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
               onViewIncident={handleNavigateToIncidents}
               onRefresh={loadBackendState}
               refreshing={refreshing}
-              loading={initialLoading || refreshing || vaultStatus === null}
+              loading={initialLoading || (vaultStatus === null && assets.length === 0)}
             />
           )}
 
@@ -274,7 +270,7 @@ export const DashboardConsole: React.FC<DashboardConsoleProps> = ({
               vaultStatus={vaultStatus}
               onRefresh={loadBackendState}
               refreshing={refreshing}
-              loading={initialLoading || refreshing || vaultStatus === null}
+              loading={initialLoading || (vaultStatus === null && assets.length === 0)}
             />
           )}
 
